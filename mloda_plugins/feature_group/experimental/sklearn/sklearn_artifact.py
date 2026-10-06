@@ -1,0 +1,280 @@
+"""
+Artifact for storing fitted scikit-learn transformers and estimators.
+"""
+
+import json
+import base64
+import logging
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from mloda.core.abstract_plugins.components.utils import contained_raise_reason
+from mloda.provider import BaseArtifact
+from mloda.provider import FeatureSet
+from mloda.provider import property_spec
+
+logger = logging.getLogger(__name__)
+
+
+class SklearnArtifact(BaseArtifact):
+    """
+    Artifact for storing fitted scikit-learn transformers and estimators.
+
+    This artifact stores fitted scikit-learn objects using joblib serialization,
+    allowing for efficient persistence and reuse of trained models and transformers.
+
+    The artifact contains:
+    - fitted_transformer: The fitted scikit-learn object
+    - feature_names: Names of input features used during fitting
+    - training_metadata: Information about the training process
+
+    This class also provides helper methods for managing multiple artifacts
+    in sklearn feature groups (encoding, scaling, pipeline).
+    """
+
+    ARTIFACT_STORAGE_PATH = "artifact_storage_path"
+    ARTIFACT_STORAGE_PATH_SPEC = property_spec(
+        "Filesystem directory for persisting fitted sklearn artifacts; owned by SklearnArtifact, exposed by each sklearn feature group. Defaults to the system temp dir.",
+        default=None,
+    )
+
+    @classmethod
+    def _serialize_artifact(cls, artifact: dict[str, Any]) -> str:
+        """
+        Serialize the artifact to a JSON string.
+
+        Args:
+            artifact: The artifact to serialize
+
+        Returns:
+            A JSON string representation of the artifact
+        """
+        try:
+            import joblib
+        except ImportError:
+            raise ImportError("joblib is required for SklearnArtifact. Install with: pip install joblib")
+
+        # Create a copy of the artifact
+        serializable_artifact = {}
+
+        # Serialize each component of the artifact
+        for key, value in artifact.items():
+            if key == "fitted_transformer":
+                # Use joblib to serialize the fitted transformer
+                import io
+
+                buffer = io.BytesIO()
+                joblib.dump(value, buffer)
+                serializable_artifact[key] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            elif key == "feature_names":
+                # Convert list to JSON
+                serializable_artifact[key] = json.dumps(value)
+            elif key == "training_timestamp":
+                # Convert timestamp to string
+                serializable_artifact[key] = str(value)
+            else:
+                # Keep other values as is
+                serializable_artifact[key] = value
+
+        # Convert the entire artifact to a JSON string
+        return json.dumps(serializable_artifact)
+
+    @classmethod
+    def _deserialize_artifact(cls, serialized_artifact: str) -> dict[str, Any]:
+        """
+        Deserialize the artifact from a JSON string.
+
+        Args:
+            serialized_artifact: The JSON string to deserialize
+
+        Returns:
+            The deserialized artifact
+        """
+        try:
+            import joblib
+        except ImportError:
+            raise ImportError("joblib is required for SklearnArtifact. Install with: pip install joblib")
+
+        # Parse the JSON string
+        serializable_artifact = json.loads(serialized_artifact)
+
+        # Create a new artifact
+        artifact = {}
+
+        # Deserialize each component of the artifact
+        for key, value in serializable_artifact.items():
+            if key == "fitted_transformer":
+                # Use joblib to deserialize the fitted transformer
+                import io
+
+                buffer = io.BytesIO(base64.b64decode(value))
+                artifact[key] = joblib.load(buffer)
+            elif key == "feature_names":
+                # Parse JSON list
+                artifact[key] = json.loads(value)
+            elif key == "training_timestamp":
+                # Keep timestamp as string for now
+                artifact[key] = value
+            else:
+                # Keep other values as is
+                artifact[key] = value
+
+        return artifact
+
+    @classmethod
+    def custom_saver(cls, features: FeatureSet, artifact: Any) -> Any | None:
+        """
+        Save sklearn artifacts to file(s).
+
+        Args:
+            features: The feature set
+            artifact: Dictionary of {artifact_key: artifact_data} where each artifact_data
+                     contains fitted_transformer, feature_name, encoder_type, etc.
+
+        Returns:
+            Dictionary of {artifact_key: file_path} where artifacts were saved
+        """
+        try:
+            import joblib
+        except ImportError:
+            raise ImportError("joblib is required for SklearnArtifact. Install with: pip install joblib")
+
+        if not isinstance(artifact, dict):
+            raise ValueError(f"Expected artifact to be a dictionary, got {type(artifact)}")
+
+        saved_paths = {}
+
+        for artifact_key, artifact_data in artifact.items():
+            # Generate unique file path for this artifact
+            file_path = cls._get_artifact_file_path_for_key(features, artifact_key)
+
+            # Save this specific artifact
+            joblib.dump(artifact_data, file_path)
+            saved_paths[artifact_key] = str(file_path)
+
+        return saved_paths
+
+    @classmethod
+    def _get_artifact_file_path_for_key(cls, features: FeatureSet, artifact_key: str) -> Path:
+        """
+        Generate a file path for storing a specific artifact by key.
+
+        Args:
+            features: The feature set
+            artifact_key: The specific artifact key (e.g., "onehot_encoded__category")
+
+        Returns:
+            Path object for the artifact file
+        """
+        # Get storage path from options or use default temp directory
+        storage_path = None
+
+        options = cls.get_singular_option_from_options(features)
+        if options:
+            storage_path = options.get(cls.ARTIFACT_STORAGE_PATH)
+
+        if storage_path is None:
+            storage_path = tempfile.gettempdir()
+
+        # Simple filename based on artifact key
+        filename = f"sklearn_artifact_{artifact_key}.joblib"
+
+        # Ensure the directory exists
+        storage_dir = Path(storage_path)
+        storage_dir.mkdir(parents=True, exist_ok=True)
+
+        return storage_dir / filename
+
+    @classmethod
+    def custom_loader(cls, features: FeatureSet) -> Any | None:
+        """
+        Load sklearn artifacts from file(s).
+
+        Args:
+            features: The feature set
+
+        Returns:
+            Dictionary of {artifact_key: artifact_data} containing all available artifacts
+        """
+        try:
+            import joblib
+        except ImportError:
+            raise ImportError("joblib is required for SklearnArtifact. Install with: pip install joblib")
+
+        # Get storage path
+        storage_path = None
+
+        options = cls.get_singular_option_from_options(features)
+        if options:
+            storage_path = options.get(cls.ARTIFACT_STORAGE_PATH)
+        if storage_path is None:
+            storage_path = tempfile.gettempdir()
+
+        storage_dir = Path(storage_path)
+        if not storage_dir.exists():
+            return None
+
+        # Find all sklearn artifact files
+        pattern = "sklearn_artifact_*.joblib"
+        loaded_artifacts = {}
+
+        for file_path in storage_dir.glob(pattern):
+            try:
+                # Extract artifact key from filename
+                filename = file_path.stem  # Remove .joblib extension
+                # Format: sklearn_artifact_{artifact_key}
+                if filename.startswith("sklearn_artifact_"):
+                    artifact_key = filename[len("sklearn_artifact_") :]
+
+                    # Load the artifact
+                    artifact_data = joblib.load(file_path)
+                    loaded_artifacts[artifact_key] = artifact_data
+
+            except Exception as e:
+                # The reason as text, not the exception: an object in LogRecord.args pins its traceback,
+                # so a retained record would hold the frames of the failed load.
+                logger.warning("Failed to load artifact from %s: %s", file_path, contained_raise_reason(e))
+                continue
+
+        if loaded_artifacts:
+            return loaded_artifacts
+        else:
+            return None
+
+    @classmethod
+    def load_sklearn_artifact(cls, features: FeatureSet, artifact_key: str) -> dict[str, Any] | None:
+        """
+        Helper method to load a specific sklearn artifact by key.
+
+        Args:
+            features: The feature set
+            artifact_key: The specific artifact key to load
+
+        Returns:
+            The artifact data if found, None otherwise
+        """
+        if features.artifact_to_load is not None:
+            artifacts = cls.custom_loader(features)
+            if artifacts and artifact_key in artifacts:
+                return artifacts[artifact_key]  # type: ignore
+            # If artifact_to_load is true but we can't find the specific key, that's an error
+            available_keys = list(artifacts.keys()) if artifacts else []
+            raise ValueError(f"Artifact not found for key '{artifact_key}'. Available artifacts: {available_keys}")
+        return None
+
+    @classmethod
+    def save_sklearn_artifact(cls, features: FeatureSet, artifact_key: str, artifact_data: dict[str, Any]) -> None:
+        """
+        Helper method to save a sklearn artifact with the proper multiple artifact format.
+
+        Args:
+            features: The feature set
+            artifact_key: The unique key for this artifact
+            artifact_data: The artifact data to save
+        """
+        if features.artifact_to_save is not None:
+            # Support multiple artifacts by using a dictionary
+            if not isinstance(features.save_artifact, dict):
+                features.save_artifact = {}
+            features.save_artifact[artifact_key] = artifact_data

@@ -1,0 +1,82 @@
+[
+  "age",
+  {
+    "name": "weight",
+    "options": {
+      "imputation_method": "mean"
+    }
+  },
+  {
+    "name": "age__mean_imputed__standard_scaled"
+  },
+  {
+    "name": "weight__mean_imputed__max_aggr"
+  },
+  {
+    "name": "weight__mean_imputed__min_aggr",
+    "options": {
+      "timewindow": 3
+    }
+  },
+  {
+    "name": "state__onehot_encoded",
+    "column_index": 0
+  },
+  {
+    "name": "state__onehot_encoded",
+    "column_index": 1
+  },
+  {
+    "name": "minmaxscaledage",
+    "options": {
+      "scaler_type": "minmax",
+      "in_features": "age"
+    }
+  },
+  {
+    "name": "age__max_aggr",
+    "in_features": ["age"]
+  },
+  {
+    "name": "min_max",
+    "options": {
+      "scaler_type": "minmax",
+      "in_features": "age__max_aggr"
+    }
+  },
+  {
+    "name": "customer_location&store_location__haversine_distance"
+  },
+  {
+    "name": "custom_geo_distance",
+    "in_features": ["customer_location", "store_location"],
+    "context_options": {
+      "distance_type": "euclidean"
+    }
+  },
+  {
+    "name": "min_max_nested",
+    "options": {
+      "scaler_type": "minmax",
+      "in_features": {
+        "name": "max_aggregated",
+        "options": {
+          "aggregation_function": "max",
+          "in_features": {
+            "name": "minmaxscaledweght",
+            "options": {
+              "scaler_type": "minmax",
+              "in_features": "weight"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "product__onehot_encoded"
+  },
+  {
+    "name": "product__onehot_encoded__sum_aggr"
+  }
+]

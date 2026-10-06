@@ -1,0 +1,142 @@
+name: CI
+
+# Explicit, not "*.md": CONTRIBUTING.md, docs/, CLAUDE.md and AGENTS.md are asserted/executed by tests (guarded by tests/test_ci_paths_ignore.py).
+# Safe only while CI is not a required status check on main: a skipped required check never reports, blocking docs-only PRs.
+on:
+  push:
+    branches: [ "main", "feat/reader-feature-groups" ]
+    paths-ignore: &docs_only
+      - CODE_OF_CONDUCT.md
+      - NOTICE.md
+      - README.md
+      - SECURITY.md
+  pull_request:
+    branches: [ "main", "feat/reader-feature-groups" ]
+    paths-ignore: *docs_only
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+# Cancel a superseded PR run; push runs get a unique group so every pushed commit is still tested.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+        toxenv: ["-e core", "-e installed"]
+        include:
+          - python-version: "3.10"
+            toxenv: "-e python310"
+          - python-version: "3.11"
+            toxenv: "-e python311"
+          - python-version: "3.12"
+            toxenv: "-e python312"
+          - python-version: "3.13"
+            toxenv: "-e python313"
+          - python-version: "3.14"
+            toxenv: "-e python314"
+          - python-version: "3.12"
+            toxenv: "-e nopyarrow"
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install tox
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install uv
+        # Same tox pin as release.yaml; see the note there before bumping.
+        uv tool install tox==4.64.1 --with tox-uv==1.36.0
+    - name: Use up to three pytest workers
+      run: |
+        nproc
+        # 4 workers on the 4-vCPU runner pushed subprocess-heavy tests past the per-test timeout.
+        echo "PYTEST_WORKERS=$(( $(nproc) < 3 ? $(nproc) : 3 ))" >> "$GITHUB_ENV"
+    - name: Run tox ${{ matrix.toxenv }}
+      run: tox ${{ matrix.toxenv }}
+      timeout-minutes: 6
+    # Catches a tox bump that brings the redirect file back (e.g. the provisional venv_redirect renamed)
+    # on the PR instead of in the Release job.
+    - name: Check tox left no .venv redirect file
+      run: |
+        if [ -e .venv ] && [ ! -d .venv ]; then
+          echo "::error ::tox left a .venv file; the release job's uv lock would fail on it. Check venv_redirect in tox.ini."
+          cat .venv
+          exit 1
+        fi
+
+  lint:
+    # ruff, licenses, mypy and bandit outside the test jobs; 3.10 and 3.14 cover both sides of uv.lock's dependency fork.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install tox
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install uv
+        # Same tox pin as release.yaml; see the note there before bumping.
+        uv tool install tox==4.64.1 --with tox-uv==1.36.0
+    - name: Run lint
+      run: tox -e lint
+      timeout-minutes: 6
+
+  notebooks:
+    # Runs the marimo example notebooks; slower than the unit-test matrix.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install tox
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install uv
+        # Same tox pin as release.yaml; see the note there before bumping.
+        uv tool install tox==4.64.1 --with tox-uv==1.36.0
+    - name: Run notebooks
+      env:
+        PYTEST_WORKERS: 2
+      run: tox -e notebooks
+      timeout-minutes: 10
+
+  spark:
+    # PYTEST_WORKERS stays at the env's default of 1: each xdist worker would start its own JVM.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install tox
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install uv
+        # Same tox pin as release.yaml; see the note there before bumping.
+        uv tool install tox==4.64.1 --with tox-uv==1.36.0
+    - name: Run spark
+      # The runner image ships Java 17.
+      run: JAVA_HOME="$JAVA_HOME_17_X64" tox -e spark
+      timeout-minutes: 10

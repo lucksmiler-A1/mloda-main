@@ -1,0 +1,180 @@
+from typing import Any
+from uuid import UUID, uuid4
+
+from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
+from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import (
+    ComputeFrameworkTransformer,
+)
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.core.cfw_manager import CfwManager
+from mloda.core.core.step.abstract_step import Step
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.optional_dependency import loaded
+from mloda.core.runtime.flight.flight_server import FlightServer
+
+
+class TransformFrameworkStep(Step):
+    def __init__(
+        self,
+        from_framework: type[ComputeFramework],
+        to_framework: type[ComputeFramework],
+        required_uuids: set[UUID],
+        from_feature_group: type[FeatureGroup],
+        to_feature_group: type[FeatureGroup],
+        link_id: UUID | None = None,
+        source_framework_uuids: set[UUID] | None = None,
+        source_step_uuid: UUID | None = None,
+        private_copy: bool = False,
+    ) -> None:
+        # A same-framework copy only its own consumers find, by the hop uuid; it must not shadow its source cfw.
+        self.private_copy = private_copy
+        if source_framework_uuids is None:
+            source_framework_uuids = set()
+        self.from_framework = from_framework
+        self.to_framework = to_framework
+        self.required_uuids = required_uuids
+        self.uuid = uuid4()
+        self.from_feature_group = from_feature_group
+        self.to_feature_group = to_feature_group
+        self.link_id = link_id
+        # Hops built by add_tfs carry at most one of link_id (join hops; holds the JoinStep token,
+        # not the Link uuid) or source_step_uuid (plain hops), never both.
+        self.source_step_uuid = source_step_uuid
+        self.transformer = ComputeFrameworkTransformer()
+
+        # This variable is only set, if the TFS was requested by a joinstep.
+        self.source_framework_uuid: UUID | None = None
+        if len(source_framework_uuids) > 0:
+            self.source_framework_uuid = next(iter(source_framework_uuids))
+
+        self.step_is_done = False
+
+        # Consumer uuids the hop marks as arrived on its SOURCE-side cfw once the hop finishes;
+        # set post-construction by ExecutionPlan.add_tfs.
+        self.owed_tokens: frozenset[UUID] = frozenset()
+
+        # Steps reading a private copy; its cfw lives until they have all finished.
+        self.copy_readers: frozenset[UUID] = frozenset()
+
+        # Tokens the hop only waits for; unlike required_uuids they never pick its source frame.
+        self.order_after_uuids: set[UUID] = set()
+
+    def get_wait_uuids(self) -> set[UUID]:
+        return self.required_uuids | self.order_after_uuids
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, TransformFrameworkStep):
+            return False
+        # A join's hop and a plain hop of the same shape are different steps (the join looks
+        # its hop up by link_id), so link_id is part of the identity; source_step_uuid is included
+        # for the same reason, since execute() only ever moves one source's data per hop.
+        return (
+            self.from_framework == other.from_framework
+            and self.to_framework == other.to_framework
+            and self.from_feature_group == other.from_feature_group
+            and self.to_feature_group == other.to_feature_group
+            and self.link_id == other.link_id
+            and self.source_step_uuid == other.source_step_uuid
+            and self.private_copy == other.private_copy
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.from_framework,
+                self.to_framework,
+                self.from_feature_group,
+                self.to_feature_group,
+                self.link_id,
+                self.source_step_uuid,
+                self.private_copy,
+            )
+        )
+
+    def get_uuids(self) -> set[UUID]:
+        return {self.uuid}
+
+    def get_parallelization_mode(self) -> set[ParallelizationMode]:
+        return self.to_framework.supported_parallelization_modes()
+
+    def execute(
+        self,
+        cfw_register: CfwManager,
+        cfw: ComputeFramework,
+        from_cfw: ComputeFramework | UUID | None = None,
+        data: Any | None = None,
+    ) -> Any | None:
+        self.location = cfw_register.get_location()
+
+        if from_cfw is None:
+            raise ValueError(
+                internal_invariant_error(
+                    "from_cfw is None when executing TransformFrameworkStep.",
+                    f"to_framework={self.to_framework.get_class_name()}, required_uuids={self.required_uuids}",
+                    "The source compute framework must be provided to transform data between frameworks.",
+                )
+            )
+
+        data = self.get_data(from_cfw)
+        data = self.transform(cfw, data)
+
+        cfw.set_data(data)
+        cfw.set_column_names()
+
+        if self.location:
+            cfw.upload_finished_data(self.location)
+            # upload_finished_data overwrites cfw.data with the Arrow transport copy; restore the
+            # native object so a same-process consumer of this cfw does not see the transport type.
+            cfw.set_data(data)
+            return data
+        return None
+
+    def get_data(self, cfw: ComputeFramework | UUID) -> Any:
+        """
+        This method is used to get the data from the compute framework.
+        If we are using multiprocessing, we use flightserver to transport the data.
+
+        If we are not using multiprocessing, we just get the data from the compute framework.
+        """
+        if isinstance(cfw, UUID) and self.location:
+            data = FlightServer.download_table(self.location, str(cfw))
+            return data
+
+        if isinstance(cfw, UUID):
+            raise ValueError("From_cfw is a UUID, but we are not using flightserver.")
+
+        return cfw.get_data()
+
+    def set_data(self, cfw: ComputeFramework, data: Any) -> None:
+        cfw.set_data(data)
+
+    def transform(self, cfw: ComputeFramework, data: Any) -> Any:
+        _from_fw = self.from_framework.expected_data_framework()
+        _to_fw = self.to_framework.expected_data_framework()
+
+        pa = loaded("pyarrow")
+        if (
+            pa is not None
+            and isinstance(data, pa.Table)
+            and isinstance(_from_fw, type)
+            and not isinstance(data, _from_fw)
+        ):
+            # Flight transport hands back a pa.Table whatever the source framework's native type is.
+            _from_fw = pa.Table
+
+        if _from_fw == _to_fw:
+            return data
+
+        # Try to find a transformation chain (direct or through PyArrow)
+        transformation_chain = self.transformer.get_transformation_chain(_from_fw, _to_fw)
+
+        if transformation_chain is None:
+            raise KeyError(
+                f"No transformation path found from {_from_fw} to {_to_fw}. "
+                f"Available transformers: {list(self.transformer.transformer_map.keys())}"
+            )
+
+        return self.transformer.apply_chain(
+            _from_fw, _to_fw, transformation_chain, data, cfw.framework_connection_object
+        )

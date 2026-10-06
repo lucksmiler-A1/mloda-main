@@ -1,0 +1,395 @@
+## Access (feature) data
+
+This framework provides several structured mechanisms for features to access and manage data, catering to diverse needs. Features can retrieve data through:
+
+-   **DataAccessCollection** for global data loading management, 
+-   **Feature Scope Data Access** for feature-specific data loading management, 
+-   **Api Data** for using data directly with the mlodaAPI request.
+-   **Data Creator** for generating data instead of loading data,
+-   **Input Features** facilitates data sharing between features.
+
+These methods ensure efficient data management while maintaining flexibility and scalability. A typical scenario involves a complex feature relying on three input features. These input features, in turn, may depend on other input features or load data using ApiData.
+
+> **Advanced**: For a detailed explanation of the underlying data access patterns (BaseInputData vs MatchData), see [Data Access Patterns](data-access-patterns.md).
+
+#### DataAccessCollection - global data access
+
+The DataAccessCollection is designed to control the access to data of any kind. The main purpose of this class is to organize and simplify interactions with these different data elements, making it easier to work to ingest data of various forms into the framework. It serves as an interface for accessing and storing of data on a global level.
+
+The DataAccessCollection can only be added via **mlodaAPI**.
+
+A DAC holds resources of four kinds:
+
+1.  **Files:** the exact location of files, e.g. `path/folder/text.txt`.
+2.  **Folders:** directories where files are located, e.g. `path/folder/`.
+3.  **Credentials:** the information needed to reach a data source, expressed as a typed `Credential` (recommended) or a plain dict, e.g. `Credential(host="example.com", password="example")`.
+4.  **Connections:** already-initialized connection objects (database connections, Spark sessions, Iceberg catalogs, etc.).
+
+When the collection holds more than one resource of the same kind, you can name them with stable handles and disambiguate per feature via `Options(context={"data_access_handle": "..."})`. See [Named Data Access Handles](named-data-access-handles.md) for the full naming model, the resolution rule, and the available error shapes; for the simple single-source cases below, naming is optional.
+
+You can apply these options like so:
+
+```py
+from mloda.user import Credential, DataAccessCollection
+
+data_access = DataAccessCollection()
+
+# Add file paths, folder paths, credentials, and connection objects
+data_access.add_file('path/to/folder/text.txt')
+data_access.add_folder('path/to/folder/')
+data_access.add_credentials(Credential(host='example.com', password='example'))
+data_access.add_connection('InitializedDBConnection')
+
+mloda.run_all(
+    feature_list,
+    data_access_collection=data_access)
+```
+
+#### Global Scope Data Access
+
+A concrete, simplified global scope data access is shown in this example:
+
+```python
+import os
+
+from mloda.user import mloda, PluginCollector
+from mloda.user import DataAccessCollection
+from mloda_plugins.feature_group.input_data.read_file_feature import ReadFileFeature
+
+
+file_path = os.getcwd()
+file_path += "/docs/docs/in_depth"
+
+data_access_collection = DataAccessCollection(folders={str(file_path)})
+
+result = mloda.run_all(
+            ["AExample", "BExample"],
+            compute_frameworks=["PandasDataFrame"],
+            # Define data access on a global level
+            data_access_collection=data_access_collection,
+            plugin_collector=PluginCollector.enabled_feature_groups({ReadFileFeature}),
+        )
+print(result)
+```
+
+Output
+
+```text
+[  AExample  BExample
+0   Value1         2
+1   Value2         3]
+```
+
+#### ReadDocument: Unstructured File Access
+
+For unstructured files (Markdown `.md`, YAML `.yaml`/`.yml`, text `.text`/`.txt`/`.TXT`), mloda provides `ReadDocumentFeature`.
+It skips structured file types (CSV, JSON, Parquet, etc.) by default to avoid conflicts
+with `ReadFile`.
+ReadDocument matches by file suffix only and ignores feature names, so when a folder or file set mixes document
+suffixes such as `.txt` with structured files (CSV, Parquet), exclude `ReadDocumentFeature` through the
+`PluginCollector` (`PluginCollector.disabled_feature_groups({ReadDocumentFeature})`) to avoid multiple feature group matches.
+
+To read a structured file type as a document, use the `document_suffixes` option:
+
+```py
+Feature("content", options={"document_suffixes": frozenset({".json"})})
+```
+
+This tells ReadDocument to include .json files and ReadFile to auto-exclude them
+for that feature.
+
+#### Disambiguating columns shared across multiple files
+
+When a `DataAccessCollection` holds multiple files that share the same column name (e.g. `id` appears in both `application_train.csv` and `bureau.csv`), the resolver refuses to guess: it raises `ValueError` listing the candidate files and asks for `data_access_handle`. `column_to_file` is a per-column shortcut that binds columns to files at construction so you don't have to set `data_access_handle` on every feature.
+
+Use `column_to_file` to pin each column to its canonical file:
+
+```py
+from mloda.user import DataAccessCollection, mloda
+
+data_access = DataAccessCollection(
+    files={"train": "application_train.csv", "bureau": "bureau.csv"},
+    column_to_file={
+        "SK_ID_CURR": "train",
+        "TARGET":     "train",
+        "AMT_CREDIT_SUM": "bureau",
+    },
+)
+
+result = mloda.run_all(
+    ["SK_ID_CURR", "TARGET", "AMT_CREDIT_SUM"],
+    compute_frameworks=["PyArrowTable"],
+    data_access_collection=data_access,
+)
+```
+
+Rules:
+- A `column_to_file` pin is authoritative once it applies to a requested feature: it short-circuits the resolver and takes precedence over `data_access_handle`, regardless of whether the `DataAccessCollection` is global- or per-feature-scoped.
+- Values may be either a file handle (a key of the `files` dict) or a file path (a value of the `files` dict); they are normalized to handles internally. Construction raises `ValueError` if a value matches neither.
+- If a batch of features has some columns pinned and others not, a `ValueError` is raised (use `column_to_file` for all columns or none in a batch).
+- For columns not listed in the map, the consumer falls back to the shared resolver: a single matching file binds, multiple matching files raise `ValueError` listing the candidates. Set `data_access_handle` on the feature's `Options` to disambiguate without `column_to_file`. See [Named Data Access Handles](named-data-access-handles.md).
+
+The existing per-feature alternative still works for one-off pinning:
+
+```py
+Feature("SK_ID_CURR", options=Options({CsvReader: "application_train.csv"}))
+```
+
+#### Feature Scope Data Access
+
+The Feature Scope Data access is instead designed to control the access to data of any kind 
+on a local level. 
+
+If data needs to be added specifically for a single feature (or features from the same feature group), you can use the feature_scope_data_access_name functionality.
+
+We show the ReadFileFeature as example. It uses the input_data ReadFile. 
+In this case, we need to provide the specific reader class: CsvReader.
+
+```py
+
+# This feature is already implemented as plugin, so do not run it again. This will raise intentional errors.
+class ReadFileFeature(FeatureGroup):
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return ReadFile()
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        reader = cls.input_data()
+        if reader is not None:
+            data = reader.load(features)
+            return data
+        raise ValueError(f"Reading file failed for feature {features.get_name_of_one_feature()}.")
+```
+
+As a side note, the ReadFileFeature was also used for the global scope automatism.
+
+To use it, we can simply:
+
+```python
+from typing import Any
+from pathlib import Path
+
+from mloda.user import mloda
+from mloda.provider import FeatureGroup, BaseInputData, FeatureSet
+from mloda.user import Feature
+from mloda_plugins.feature_group.input_data.read_file import ReadFile
+from mloda_plugins.feature_group.input_data.read_files.csv import CsvReader
+
+
+file_path = os.getcwd()
+file_path += "/docs/docs/in_depth"
+
+feature_list: list[Feature | str] = []
+feature_list.append(
+    Feature(
+        name="AExample",
+        # Define data access on a feature level
+        options={CsvReader.get_class_name(): file_path}),
+)
+
+
+result = mloda.run_all(feature_list, compute_frameworks=["PandasDataFrame"])
+print(result)
+```
+
+Output
+
+```text
+[  AExample
+0   Value1
+1   Value2]
+```
+
+Of course, we do not always want to load data during run. 
+We might want to give data to the framework. 
+For this purpose, we have the ApiData.
+
+#### ApiData
+
+The ApiData can read data given to mlodaAPI at request time. The built-in `ApiInputDataFeature` handles this - it receives data from the `api_data` parameter and makes it available as features.
+
+Use cases:
+
+- web requests
+- real-time prediction
+- features as parameters
+
+The following example shows a simple ApiData setup.
+
+```python
+from mloda.user import mloda
+from mloda.user.pandas import PandasDataFrame
+
+# Pass api_data directly as a dict - the framework handles registration internally
+result = mloda.run_all(
+        ["FeatureInputAPITest"],
+        compute_frameworks=[PandasDataFrame],
+        api_data={"ExampleApiData": {"FeatureInputAPITest": ["TestValue3", "TestValue4"]}},
+)
+for res in result:
+    print(res)
+```
+
+Output:
+
+```text
+  FeatureInputAPITest
+0          TestValue3
+1          TestValue4
+```
+
+Further, we do not want to always load data from outside, be it before or during the framework run, but we want to be able to create Data. For this purpose, we have the Data Creator.
+
+#### Data Creator
+
+The data creator can create data independent of any other dependency. It is essentially a base feature that does not need a **DataAccessCollection** or **Feature Scope Data Access**.
+
+Usage:
+
+- test data,
+- sample data,
+- dummy data,
+- parameter data
+
+One could imagine that for experimenting one wants to see data. Then one could use this feature as input feature to another feature instead of e.g. the true data.
+
+```python
+from mloda.user import mloda
+from mloda.provider import FeatureGroup, BaseInputData, FeatureSet, DataCreator
+from mloda.user.pandas import PandasDataFrame
+
+# Create a Creator FeatureGroup class, which delivers the data needed
+class AFeatureInputCreator(FeatureGroup):
+
+    # Define input_data with using DataCreator
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({"AFeatureInputCreator"})
+
+    # Define the data this feature creates
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {"AFeatureInputCreator": ["TestValue5", "TestValue6"]}
+
+result = mloda.run_all(
+        ["AFeatureInputCreator"],
+        compute_frameworks=[PandasDataFrame],
+)
+for res in result:
+     print(res)
+```
+
+Output
+
+```text
+  AFeatureInputCreator
+0          TestValue5
+1          TestValue6
+```
+
+Finally, as also the most important way to get data, is actually to depend on data inside the framework already. For this purpose, a feature can load data depending on other features.
+
+#### Input features 
+
+The input_features method allows a feature to access data from other features. This enables data sharing and collaboration between different components of your system.
+
+This is one of the key aspects in how we achieve to split data from processes. 
+
+In the following example, we will use data from another feature.
+```python
+from mloda.user import mloda
+from mloda.provider import FeatureGroup, FeatureSet
+from mloda.user import Options, FeatureName, Feature, PluginCollector
+
+# Set this variable as convention (internal key name)
+_in_features = "in_features"
+
+
+# First, we create a class, which uses input features from another class
+class AInputFeatureGroup(FeatureGroup):
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+
+        # We use the source to make this feature flexible.
+        # One could give here different feature names via the configuration.
+        mloda_source = options.get(_in_features)
+        if mloda_source is None:
+            raise ValueError(f"Option '{_in_features}' is required.")
+
+        features = set()
+        for source in mloda_source:
+            features.add(Feature(name=source,                # source in this example is <AFeatureInputCreator>
+                                 initial_requested_data=True # To see this feature also in the output, we can set this var to true.
+                                 )
+            )
+        return features
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        data["AInputFeatureGroup"] = len(data)
+        return data
+
+
+feature_list = []
+feature_list.append(
+    Feature(name="AInputFeatureGroup", options={_in_features: frozenset(["AFeatureInputCreator"])})
+)
+
+result = mloda.run_all(
+    feature_list,
+    compute_frameworks=[PandasDataFrame],
+    plugin_collector=PluginCollector.enabled_feature_groups({AInputFeatureGroup, AFeatureInputCreator})
+
+)
+print(result)
+```
+
+Output:
+
+```text
+[AFeatureInputCreator
+0           TestValue5
+1           TestValue6,    
+AInputFeatureGroup
+0                   2
+1                   2]
+.......
+```
+
+As the input features can be fulfilled by **multiple other features**, we can have the same processes running in different environments, migrations and processes.
+
+#### Combining Data Sources with Links
+
+When input features come from different sources (e.g., ApiData and DataCreator), you can join them using Links. Create a `Link` in `input_features()` and attach it to a `Feature`:
+
+```python
+from mloda.user import Link, Index, Feature
+from mloda.provider import FeatureGroup, FeatureSet
+from mloda.provider import ApiInputDataFeature
+
+class JoinedFeature(FeatureGroup):
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        # Create a LEFT join between mloda data and Creator data
+        link = Link.left(
+            (ApiInputDataFeature, Index(("api_id",))),
+            (CreatorDataFeature, Index(("creator_id",)))
+        )
+
+        # Attach link to one feature, set index on both
+        return {
+            Feature(name="api_value", link=link, index=Index(("api_id",))),
+            Feature(name="creator_value", index=Index(("creator_id",))),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        # Data from both sources is now joined
+        data["JoinedFeature"] = data["api_value"] + "_" + data["creator_value"]
+        return data
+```
+
+Available join methods: `Link.left()`, `Link.inner()`, `Link.outer()`, `Link.append()`, `Link.union()`.
+
+> See `tests/test_plugins/integration_plugins/test_api_link_join.py` for a complete working example.

@@ -1,0 +1,125 @@
+"""
+Integration tests for combined feature groups.
+"""
+
+from mloda.user import mloda
+from mloda.user import Feature
+from mloda.user import PluginCollector
+
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.pandas import PandasAggregatedFeatureGroup
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.pyarrow import PyArrowAggregatedFeatureGroup
+from mloda_plugins.feature_group.experimental.data_quality.missing_value.pandas import PandasMissingValueFeatureGroup
+from mloda_plugins.feature_group.experimental.data_quality.missing_value.pyarrow import PyArrowMissingValueFeatureGroup
+from mloda_plugins.feature_group.experimental.time_window.pandas import PandasTimeWindowFeatureGroup
+from mloda_plugins.feature_group.experimental.time_window.pyarrow import PyArrowTimeWindowFeatureGroup
+
+from tests.test_plugins.feature_group.experimental.test_combined_feature_groups.test_combined_utils import (
+    PandasCombinedFeatureTestDataCreator,
+    PyArrowCombinedFeatureTestDataCreator,
+    validate_combined_features,
+)
+
+
+class TestCombinedFeatureGroupsPandas:
+    """Integration tests for combining multiple feature groups using Pandas."""
+
+    def test_max_aggr_sum_7_day_window_mean_imputed_price(self) -> None:
+        """
+        Test a feature that combines missing value imputation, time window, and aggregation.
+
+        This test demonstrates the composability of feature groups in the mloda framework
+        by creating a feature that:
+        1. First imputes missing values in a price feature using mean imputation
+        2. Then applies a 7-day time window sum operation on the imputed price
+        3. Finally applies a max aggregation on the time-windowed feature
+        """
+
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {
+                PandasCombinedFeatureTestDataCreator,
+                PandasMissingValueFeatureGroup,
+                PandasTimeWindowFeatureGroup,
+                PandasAggregatedFeatureGroup,
+            }
+        )
+
+        # Define the feature chain
+        features: list[Feature | str] = [
+            "price",  # Source data with missing values
+            "price__mean_imputed",  # Step 1: Mean imputation
+            "price__mean_imputed__sum_7_day_window",  # Step 2: 7-day window sum
+            "price__mean_imputed__sum_7_day_window__max_aggr",  # Step 3: Max aggregation
+        ]
+
+        # Run the mloda with the feature chain
+        result = mloda.run_all(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            plugin_collector=plugin_collector,
+        )
+
+        # Validate the results
+        validate_combined_features(result)
+
+        result2 = mloda.run_all(
+            ["price__mean_imputed__sum_7_day_window__max_aggr"],
+            compute_frameworks=[PandasDataFrame],
+            plugin_collector=plugin_collector,
+        )
+
+        for res in result:
+            if "price__mean_imputed__sum_7_day_window__max_aggr" in res.columns:
+                res_check = res["price__mean_imputed__sum_7_day_window__max_aggr"]
+
+        for res in result2:
+            if "price__mean_imputed__sum_7_day_window__max_aggr" in res.columns:
+                res2_check = res["price__mean_imputed__sum_7_day_window__max_aggr"]
+
+        assert res_check.equals(res2_check)
+
+
+class TestCombinedFeatureGroupsPyArrow:
+    """Integration tests for combining multiple feature groups using PyArrow."""
+
+    def test_max_aggr_sum_7_day_window_mean_imputed_price(self) -> None:
+        """
+        Test a feature that combines missing value imputation, time window, and aggregation.
+
+        This test demonstrates the composability of feature groups in the mloda framework
+        by creating a feature that:
+        1. First imputes missing values in a price feature using mean imputation
+        2. Then applies a 7-day time window sum operation on the imputed price
+        3. Finally applies a max aggregation on the time-windowed feature
+        """
+
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {
+                PyArrowCombinedFeatureTestDataCreator,
+                PyArrowMissingValueFeatureGroup,
+                PyArrowTimeWindowFeatureGroup,
+                PyArrowAggregatedFeatureGroup,
+            }
+        )
+
+        # Define the feature chain
+        features: list[Feature | str] = [
+            "price",  # Source data with missing values
+            "price__mean_imputed",  # Step 1: Mean imputation
+            "price__mean_imputed__sum_7_day_window",  # Step 2: 7-day window sum
+            "price__mean_imputed__sum_7_day_window__max_aggr",  # Step 3: Max aggregation
+        ]
+
+        # Run the mloda with the feature chain
+        result = mloda.run_all(
+            features,
+            compute_frameworks=[PyArrowTable],
+            plugin_collector=plugin_collector,
+        )
+
+        # Validate the results
+        validate_combined_features(result)

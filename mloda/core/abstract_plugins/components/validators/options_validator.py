@@ -1,0 +1,72 @@
+from typing import Any
+
+from mloda.core.abstract_plugins.components.credential_scrub import redact_option_value
+
+
+class OptionsValidator:
+    """Validates Options configuration consistency."""
+
+    @staticmethod
+    def validate_no_duplicate_keys(group: dict[str, Any], context: dict[str, Any]) -> None:
+        """
+        Ensure no key exists in both group and context.
+
+        Raises ValueError if any key exists in both, with duplicate keys in message.
+        """
+        duplicate_keys = set(group.keys()) & set(context.keys())
+        if duplicate_keys:
+            raise ValueError(f"Keys cannot exist in both group and context: {duplicate_keys}")
+
+    @staticmethod
+    def validate_can_add_to_group(key: str, value: Any, group: dict[str, Any], context: dict[str, Any]) -> None:
+        """
+        Validate that a key can be added to group.
+
+        Checks:
+        1. If key exists in group with different value -> ValueError (include key in message)
+        2. If key exists in context -> ValueError (include key in message)
+        """
+        if key in group:
+            if value != group[key]:
+                raise ValueError(
+                    f"Key {key} already exists in group options with a different value: "
+                    f"{redact_option_value(group[key])}"
+                )
+        if key in context:
+            raise ValueError(f"Key {key} already exists in context options. Cannot add to group.")
+
+    @staticmethod
+    def validate_can_add_to_context(key: str, value: Any, group: dict[str, Any], context: dict[str, Any]) -> None:
+        """
+        Validate that a key can be added to context.
+
+        Checks:
+        1. If key exists in context with different value -> ValueError (include key in message)
+        2. If key exists in group -> ValueError (include key in message)
+        """
+        if key in context:
+            if value != context[key]:
+                raise ValueError(
+                    f"Key {key} already exists in context options with a different value: "
+                    f"{redact_option_value(context[key])}"
+                )
+        if key in group:
+            raise ValueError(f"Key {key} already exists in group options. Cannot add to context.")
+
+    @staticmethod
+    def validate_propagate_keys_in_context(keys: frozenset[str], context: dict[str, Any]) -> None:
+        """Validate that all propagate_context_keys exist in context."""
+        missing = keys - set(context.keys())
+        if missing:
+            raise ValueError(f"propagate_context_keys {missing} not found in context")
+
+    @staticmethod
+    def validate_no_context_group_conflicts(other_context_keys: set[str], self_group_keys: set[str]) -> None:
+        """
+        Validate no conflicts between other's context keys and self's group keys.
+
+        Raises ValueError if any key exists in both, with conflicting keys in message.
+        """
+        conflicting = other_context_keys & self_group_keys
+        if conflicting:
+            raise ValueError(f"Cannot propagate context: keys already exist in group: {conflicting}")

@@ -1,0 +1,298 @@
+from collections.abc import Sequence
+from typing import Any
+from mloda.core.abstract_plugins.components.data_types import DataType
+from mloda.provider import BaseMergeEngine
+from mloda.user import FeatureName, ParallelizationMode
+from mloda.provider import ComputeFramework, ConnectionRequirement
+from mloda.provider import BaseFilterEngine
+from mloda.provider import OutputSchema
+from mloda_plugins.compute_framework.base_implementations.iceberg.iceberg_filter_engine import (
+    IcebergFilterEngine,
+    scan_columns,
+)
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import (
+    arrow_schema_field_type,
+    arrow_schema_output_schema,
+)
+
+try:
+    from pyiceberg.catalog import Catalog
+    from pyiceberg.table import Table as IcebergTable
+    from pyiceberg.types import (
+        BinaryType,
+        BooleanType,
+        DateType,
+        DecimalType,
+        DoubleType,
+        FloatType,
+        IntegerType,
+        LongType,
+        StringType,
+        TimestampType,
+        TimestamptzType,
+    )
+    import pyarrow as pa
+except ImportError:
+    Catalog = None  # type: ignore[assignment,misc]
+    IcebergTable = None  # type: ignore[assignment,misc]
+    BinaryType = None  # type: ignore[assignment,misc]
+    BooleanType = None  # type: ignore[assignment,misc]
+    DateType = None  # type: ignore[assignment,misc]
+    DecimalType = None  # type: ignore[assignment,misc]
+    DoubleType = None  # type: ignore[assignment,misc]
+    FloatType = None  # type: ignore[assignment,misc]
+    IntegerType = None  # type: ignore[assignment,misc]
+    LongType = None  # type: ignore[assignment,misc]
+    StringType = None  # type: ignore[assignment,misc]
+    TimestampType = None  # type: ignore[assignment,misc]
+    TimestamptzType = None  # type: ignore[assignment,misc]
+    pa = None  # type: ignore[assignment, unused-ignore]
+
+
+class IcebergFramework(ComputeFramework):
+    """
+    Iceberg compute framework implementation.
+
+    This framework provides integration with Apache Iceberg tables, supporting
+    schema evolution, time travel, and efficient data management. It uses PyArrow
+    as the interchange format for compatibility with other mloda frameworks.
+
+    Note: This implementation focuses on read operations. The catalog must be
+    provided via set_framework_connection_object() before use.
+    """
+
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
+        """
+        Set the Iceberg catalog for table operations.
+
+        Args:
+            framework_connection_object: Iceberg catalog instance
+        """
+        if Catalog is None:
+            raise ImportError("PyIceberg is not installed. To use this framework, please install pyiceberg.")
+
+        if self.framework_connection_object is None:
+            if framework_connection_object is not None:
+                # Accept either a catalog instance or a table instance
+                if hasattr(framework_connection_object, "load_table"):
+                    # It's a catalog
+                    self.framework_connection_object = framework_connection_object
+                elif isinstance(framework_connection_object, IcebergTable):
+                    # It's already a table - store it directly
+                    self.framework_connection_object = framework_connection_object
+                else:
+                    raise ValueError(f"Expected an Iceberg catalog or table, got {type(framework_connection_object)}")
+
+    @classmethod
+    def connection_requirement(cls) -> ConnectionRequirement:
+        return ConnectionRequirement.SELF_MANAGED
+
+    @classmethod
+    def _connection_matches(cls, conn: Any) -> bool:
+        if Catalog is None:
+            return False
+        return hasattr(conn, "load_table") or (IcebergTable is not None and isinstance(conn, IcebergTable))
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if PyIceberg is installed and available."""
+        try:
+            import pyiceberg  # noqa: F401
+            import pyarrow  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    @classmethod
+    def supported_parallelization_modes(cls) -> set[ParallelizationMode]:
+        """The live catalog handle cannot cross a process boundary."""
+        return {ParallelizationMode.SYNC, ParallelizationMode.THREADING}
+
+    @classmethod
+    def expected_data_framework(cls) -> Any:
+        """Return the expected Iceberg table type."""
+        if IcebergTable is None:
+            raise ImportError("PyIceberg is not installed. To use this framework, please install pyiceberg.")
+        return IcebergTable
+
+    @classmethod
+    def merge_engine(cls) -> type[BaseMergeEngine]:
+        """Iceberg tables don't support direct merging in this framework context."""
+        raise NotImplementedError(
+            f"Merge functionality is not implemented for {cls.__name__}. "
+            "Iceberg tables are typically used for data lake scenarios where merging "
+            "is handled at the catalog/table/engine level, not at the compute framework level."
+        )
+
+    def select_data_by_column_names(
+        self,
+        data: Any,
+        selected_feature_names: Sequence[FeatureName],
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
+    ) -> Any:
+        """Select the requested columns; an Iceberg table is scanned into a pa.Table."""
+        column_names = self._extract_column_names(data)
+        selected = list(
+            self.identify_naming_convention(
+                selected_feature_names,
+                column_names,
+                ordering=column_ordering,
+                request_feature_order=request_feature_order,
+            )
+        )
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            data = scan_columns(data, selected)
+        return data.select(selected)
+
+    @classmethod
+    def extract_column_names(cls, data: Any) -> set[str]:
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            return set(data.schema().column_names)
+        # After transform, data may be a PyArrow table
+        return set(data.schema.names)
+
+    def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            schema = data.schema()
+            if column_name not in set(schema.column_names):
+                return None
+            field = schema.find_field(column_name)
+            if field is None:
+                return None
+            return str(field.field_type)
+        if pa is not None and isinstance(data, pa.Table):
+            arrow_type = arrow_schema_field_type(data.schema, column_name)
+            if arrow_type is None:
+                return None
+            return str(arrow_type)
+        return None
+
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            schema = data.schema()
+            if column_name not in set(schema.column_names):
+                return None
+            field = schema.find_field(column_name)
+            if field is None:
+                return None
+            field_type = field.field_type
+            if isinstance(field_type, IntegerType):
+                return DataType.INT32
+            if isinstance(field_type, LongType):
+                return DataType.INT64
+            if isinstance(field_type, FloatType):
+                return DataType.FLOAT
+            if isinstance(field_type, DoubleType):
+                return DataType.DOUBLE
+            if isinstance(field_type, BooleanType):
+                return DataType.BOOLEAN
+            if isinstance(field_type, StringType):
+                return DataType.STRING
+            if isinstance(field_type, BinaryType):
+                return DataType.BINARY
+            if isinstance(field_type, DateType):
+                return DataType.DATE
+            if isinstance(field_type, (TimestampType, TimestamptzType)):
+                return DataType.TIMESTAMP_MICROS
+            if isinstance(field_type, DecimalType):
+                return DataType.DECIMAL
+            return None
+        if pa is not None and isinstance(data, pa.Table):
+            arrow_type = arrow_schema_field_type(data.schema, column_name)
+            if arrow_type is None:
+                return None
+            return DataType.from_arrow_type_safe(arrow_type)
+        return None
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Read the schema once and build the sorted (name, dtype) pairs directly: for a native
+        Iceberg table, schema.column_names (nested fields included, e.g. "b.c") read once, then
+        schema.find_field(name) per name, an O(1) cached lookup rather than the O(columns) rebuild
+        of set(schema.column_names) the old per-column path did. For the PyArrow interchange shape
+        reached post-transform, delegate to the same helper PyArrowTable uses.
+        """
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            schema = data.schema()
+            names = schema.column_names
+            if not names:
+                return None
+            seen: dict[str, str | None] = {}
+            for name in names:
+                field = schema.find_field(name)
+                seen.setdefault(name, None if field is None else str(field.field_type))
+            return tuple((name, seen[name]) for name in sorted(seen, key=str))
+        if pa is not None and isinstance(data, pa.Table):
+            return arrow_schema_output_schema(data.schema)
+        return super()._output_schema(data)
+
+    def transform(self, data: Any, feature_names: Sequence[str]) -> Any:
+        """
+        Transform data to Iceberg table format.
+
+        Args:
+            data: Input data (dict, PyArrow table, etc.)
+            feature_names: Sequence of feature names
+
+        Returns:
+            Transformed data in Iceberg table format
+        """
+        # First try the standard transformer approach
+        transformed_data = self.apply_compute_framework_transformer(data)
+        if transformed_data is not None:
+            return transformed_data
+
+        if isinstance(data, dict):
+            """Initial data: Transform dict to PyArrow table (Iceberg table creation requires catalog context)"""
+            # Convert dict to PyArrow table first
+            # The transformer will handle conversion to Iceberg table when needed
+            if pa is None:
+                raise ImportError("PyArrow is not installed. To use this framework, please install pyarrow.")
+            return pa.Table.from_pydict(data)
+
+        if isinstance(data, IcebergTable):
+            """Data is already an Iceberg table"""
+            return data
+
+        if pa is not None and isinstance(data, pa.Table):
+            """PyArrow table: Pass through as-is since Iceberg can work with PyArrow"""
+            # For now, we'll pass PyArrow tables through as-is
+            # In a real implementation, you might want to convert to Iceberg table
+            # but that requires catalog context and table naming
+            return data
+
+        raise ValueError(f"Data type {type(data)} is not supported by {self.__class__.__name__}")
+
+    def validate_expected_framework(self, location: str | None = None) -> None:
+        """
+        Override to accept both Iceberg tables and PyArrow tables.
+
+        Since Iceberg framework can work with PyArrow tables as an interchange format,
+        we accept both types.
+        """
+        if self.expected_data_framework() is None:
+            return
+
+        if self.data is None:
+            return
+
+        # If location is a string, it means it is a uuid of the object in arrow flight.
+        if isinstance(location, str) and self.data is not None:
+            return
+
+        # Accept both Iceberg tables and PyArrow tables
+        if isinstance(self.data, self.expected_data_framework()):
+            return
+
+        if pa is not None and isinstance(self.data, pa.Table):
+            return
+
+        raise ValueError(f"Data type {type(self.data)} is not supported by {self.__class__.__name__}")
+
+    @classmethod
+    def filter_engine(cls) -> type[BaseFilterEngine]:
+        """Return the Iceberg filter engine."""
+        return IcebergFilterEngine

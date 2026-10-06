@@ -1,0 +1,223 @@
+import logging
+from decimal import Decimal
+from typing import Any
+
+import pyarrow as pa
+import pytest
+
+from mloda.user import FeatureName, ParallelizationMode
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from tests.test_plugins.compute_framework.base_implementations.datatype_validator_test_mixin import (
+    DataTypeValidatorFrameworkTestMixin,
+)
+from tests.test_plugins.compute_framework.base_implementations.dict_interchange_output_schema_test_mixin import (
+    DictInterchangeOutputSchemaTestMixin,
+)
+from tests.test_plugins.compute_framework.base_implementations.dtype_extraction_test_mixin import (
+    DtypeExtractionTestMixin,
+    DuplicateColumnDtypeExtractionTestMixin,
+)
+from tests.test_plugins.compute_framework.base_implementations.empty_result_test_mixin import (
+    EmptyResultFrameworkTestMixin,
+)
+from tests.test_plugins.compute_framework.test_tooling.availability_test_helper import (
+    assert_unavailable_when_import_blocked,
+)
+from tests.test_plugins.compute_framework.test_tooling.dataframe_test_base import DataFrameTestBase
+
+logger = logging.getLogger(__name__)
+
+try:
+    import pandas as pd
+except ImportError:
+    logger.warning("Pandas is not installed. Some tests will be skipped.")
+    pd = None
+
+
+class TestPandasDataFrameAvailability:
+    def test_is_available_when_pandas_not_installed(self) -> None:
+        """Test that is_available() returns False when pandas import fails."""
+        assert_unavailable_when_import_blocked(PandasDataFrame, ["pandas"])
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasDataFrameComputeFramework:
+    @pytest.fixture
+    def pd_dataframe(self) -> PandasDataFrame:
+        """Create a fresh PandasDataFrame instance for each test."""
+        return PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+    @pytest.fixture
+    def expected_data(self, dict_data: dict[str, list[int]]) -> Any:
+        """Create fresh expected DataFrame for each test."""
+        return PandasDataFrame.pd_dataframe().from_dict(dict_data)
+
+    def test_expected_data_framework(self, pd_dataframe: PandasDataFrame) -> None:
+        assert pd_dataframe.expected_data_framework() == pd.DataFrame
+
+    def test_transform_dict_to_table(
+        self, pd_dataframe: PandasDataFrame, dict_data: dict[str, list[int]], expected_data: Any
+    ) -> None:
+        assert all(pd_dataframe.transform(dict_data, []) == expected_data)
+
+    def test_transform_arrays(self) -> None:
+        data = PandasDataFrame.pd_series()([1, 2, 3])
+        _pdDf = PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+        _pdDf.set_data(PandasDataFrame.pd_dataframe().from_dict({"existing_column": [4, 5, 6]}))
+
+        data = _pdDf.transform(data=data, feature_names=["new_column"])
+        assert data.equals(
+            PandasDataFrame.pd_dataframe().from_dict({"existing_column": [4, 5, 6], "new_column": [1, 2, 3]})
+        )
+
+    def test_transform_invalid_data(self, pd_dataframe: PandasDataFrame) -> None:
+        with pytest.raises(ValueError):
+            pd_dataframe.transform(data=["a"], feature_names=[])
+
+    def test_select_data_by_column_names(self, pd_dataframe: PandasDataFrame, expected_data: Any) -> None:
+        data = pd_dataframe.select_data_by_column_names(expected_data, [FeatureName("column1")])
+        assert data.columns == ["column1"]
+
+    def test_set_column_names(self, pd_dataframe: PandasDataFrame, expected_data: Any) -> None:
+        pd_dataframe.data = expected_data
+        pd_dataframe.set_column_names()
+        assert pd_dataframe.column_names == {"column1", "column2"}
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasTransformList:
+    def test_transform_list_of_dicts(self) -> None:
+        """PandasDataFrame should handle list of dicts (document reader output)."""
+        pdf = PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+        data = [{"content": "hello world", "source": "/path/to/file.txt", "file_type": "text"}]
+
+        result = pdf.transform(data, ["content"])
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 1
+        assert "content" in result.columns
+        assert result["content"].iloc[0] == "hello world"
+        assert result["source"].iloc[0] == "/path/to/file.txt"
+
+    def test_transform_list_of_multiple_dicts(self) -> None:
+        """PandasDataFrame should handle multiple dicts in list."""
+        pdf = PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+        data = [
+            {"content": "first", "source": "/path/a.json", "file_type": "json"},
+            {"content": "second", "source": "/path/b.json", "file_type": "json"},
+        ]
+
+        result = pdf.transform(data, ["content"])
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 2
+        assert result["content"].iloc[0] == "first"
+        assert result["content"].iloc[1] == "second"
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasDataFrameMerge(DataFrameTestBase):
+    """Test PandasDataFrame merge operations using the base test class."""
+
+    @classmethod
+    def framework_class(cls) -> type[Any]:
+        """Return the PandasDataFrame class."""
+        return PandasDataFrame
+
+    def create_dataframe(self, data: dict[str, Any]) -> Any:
+        """Create a pandas DataFrame from a dictionary."""
+        return pd.DataFrame.from_dict(data)
+
+    def get_connection(self) -> Any | None:
+        """Return connection object (None for pandas)."""
+        return None
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasDtypeExtraction(DtypeExtractionTestMixin, DuplicateColumnDtypeExtractionTestMixin):
+    """Test PandasDataFrame._extract_column_dtype using shared mixin."""
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+    @pytest.fixture
+    def dtype_sample_data(self) -> Any:
+        return pd.DataFrame({"int_col": [1, 2, 3], "str_col": ["a", "b", "c"], "float_col": [1.0, 2.0, 3.0]})
+
+    @pytest.fixture
+    def decimal_sample_data(self) -> Any:
+        values = [Decimal("12.34"), Decimal("5.50"), Decimal("99.99"), None]
+        return pd.DataFrame({"d": pd.Series(values, dtype=pd.ArrowDtype(pa.decimal128(10, 2)))})
+
+    def test_extract_object_decimal_column_data_type_is_none(self, framework_instance: Any) -> None:
+        values = [Decimal("12.34"), Decimal("5.50"), Decimal("99.99"), None]
+        data = pd.DataFrame({"d": pd.Series(values)})
+        assert framework_instance._extract_column_data_type(data, "d") is None
+
+    # Dtypes are declared explicitly because pandas 2.x infers `object` where pandas 3.x infers `str`,
+    # which would make the first-occurrence assertions depend on the installed pandas version.
+    @pytest.fixture
+    def dtype_duplicate_column_data(self) -> Any:
+        frame = pd.DataFrame(
+            {"first": pd.Series([1, 2, 3], dtype="int64"), "second": pd.Series(["x", "y", "z"], dtype="string")}
+        )
+        frame.columns = ["dup_col", "dup_col"]
+        return frame
+
+    @pytest.fixture
+    def dtype_duplicate_column_data_reversed(self) -> Any:
+        frame = pd.DataFrame(
+            {"first": pd.Series(["x", "y", "z"], dtype="string"), "second": pd.Series([1, 2, 3], dtype="int64")}
+        )
+        frame.columns = ["dup_col", "dup_col"]
+        return frame
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasDictInterchangeOutputSchema(DictInterchangeOutputSchemaTestMixin):
+    """Test PandasDataFrame._output_schema on the dict interchange shape using shared mixin."""
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasDataTypeValidator(DataTypeValidatorFrameworkTestMixin):
+    """Test DataTypeValidator enforcement on PandasDataFrame using shared mixin.
+
+    str_col uses explicit ``pd.StringDtype()`` (via the type map) so the resolver returns
+    STRING; plain object dtype would be ambiguous and resolve to None.
+    """
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+    def from_arrow(self, table: pa.Table) -> Any:
+        # Option A: arrow -> pandas via to_pandas. types_mapper preserves pd.StringDtype()
+        # for STRING columns; coerce_temporal_nanoseconds=False keeps ms/us timestamp units.
+        return table.to_pandas(
+            types_mapper={pa.string(): pd.StringDtype()}.get,
+            coerce_temporal_nanoseconds=False,
+        )
+
+
+@pytest.mark.skipif(pd is None, reason="Pandas is not installed. Skipping this test.")
+class TestPandasEmptyResult(EmptyResultFrameworkTestMixin):
+    """Test PandasDataFrame schema detection via shared mixin (zero-row frame keeps columns)."""
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return PandasDataFrame(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
+
+    @pytest.fixture
+    def empty_data(self) -> Any:
+        return pd.DataFrame({"a": pd.Series([], dtype="int64")})
+
+    @pytest.fixture
+    def non_empty_data(self) -> Any:
+        return pd.DataFrame({"a": [1]})

@@ -1,0 +1,627 @@
+import importlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+import attribution.attributions as attributions_module
+from attribution.attributions import (
+    add_file_to_git,
+    download_files,
+    get_version,
+    remove_tox,
+    run_sync_version_command,
+    run_tox,
+    update_mloda_version,
+    update_third_party_licenses_version,
+)
+
+
+class TestGetVersion:
+    def test_reads_version_from_valid_pyproject(self, tmp_path: Path) -> None:
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[project]\nversion = "1.2.3"\n')
+        assert get_version(str(pyproject)) == "1.2.3"
+
+    def test_raises_on_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            get_version(str(tmp_path / "nonexistent.toml"))
+
+    def test_raises_on_missing_key(self, tmp_path: Path) -> None:
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text("[project]\n")
+        with pytest.raises(KeyError):
+            get_version(str(pyproject))
+
+
+class TestLazyTomlImport:
+    def test_module_imports_without_tomli_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Importing the module must not require tomli/tomllib (release Python 3.10 lacks tomli outside tox)."""
+        monkeypatch.setitem(sys.modules, "tomli", None)
+        monkeypatch.setitem(sys.modules, "tomllib", None)
+        try:
+            importlib.reload(attributions_module)
+        finally:
+            monkeypatch.undo()
+            importlib.reload(attributions_module)
+
+
+class TestDownloadFiles:
+    @patch("attribution.attributions.urlopen")
+    def test_downloads_file_to_output_dir(self, mock_urlopen: MagicMock, tmp_path: Path) -> None:
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.read = MagicMock(side_effect=[b"file content", b""])
+
+        mock_urlopen.return_value = mock_response
+
+        download_files("https://example.com/", ["test.txt"], str(tmp_path))
+
+        mock_urlopen.assert_called_once_with("https://example.com/test.txt")
+        assert (tmp_path / "test.txt").read_bytes() == b"file content"
+
+    @patch("attribution.attributions.urlopen")
+    def test_downloads_multiple_files(self, mock_urlopen: MagicMock, tmp_path: Path) -> None:
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.read = MagicMock(side_effect=[b"content1", b"", b"content2", b""])
+
+        mock_urlopen.return_value = mock_response
+
+        download_files("https://example.com/", ["a.txt", "b.txt"], str(tmp_path))
+
+        assert mock_urlopen.call_count == 2
+
+
+class TestRemoveTox:
+    def test_removes_existing_tox_directory(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        tox_dir = tmp_path / ".tox"
+        tox_dir.mkdir()
+        (tox_dir / "somefile").touch()
+
+        assert remove_tox() is True
+        assert not tox_dir.exists()
+
+    def test_returns_true_when_tox_does_not_exist(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert remove_tox() is True
+
+
+class TestRunTox:
+    @patch("attribution.attributions.subprocess.run")
+    def test_calls_tox(self, mock_run: MagicMock) -> None:
+        assert run_tox() is True
+        mock_run.assert_called_once_with(["tox"], check=True)
+
+    @patch("attribution.attributions.subprocess.run", side_effect=subprocess.CalledProcessError(1, "tox"))
+    def test_raises_on_tox_failure(self, mock_run: MagicMock) -> None:
+        with pytest.raises(subprocess.CalledProcessError):
+            run_tox()
+
+
+class TestAddFileToGit:
+    @patch("attribution.attributions.subprocess.run")
+    def test_stages_files(self, mock_run: MagicMock) -> None:
+        add_file_to_git(["a.md", "b.md"], "output/")
+        assert mock_run.call_args_list == [
+            call(["git", "add", os.path.join("output/", "a.md")], check=True),
+            call(["git", "add", os.path.join("output/", "b.md")], check=True),
+        ]
+
+    @patch("attribution.attributions.subprocess.run", side_effect=subprocess.CalledProcessError(1, "git"))
+    def test_raises_on_git_failure(self, mock_run: MagicMock) -> None:
+        with pytest.raises(subprocess.CalledProcessError):
+            add_file_to_git(["file.md"], "output/")
+
+
+class TestUpdateMlodaVersion:
+    def test_updates_only_the_mloda_version_cell(self) -> None:
+        content = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+            "| zeta  | 2.3.4   | BSD        |\n"
+        )
+        expected = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 1.0.0   | Apache-2.0 |\n"
+            "| zeta  | 2.3.4   | BSD        |\n"
+        )
+        assert update_mloda_version(content, "1.0.0") == expected
+
+    def test_widens_version_column_when_new_version_is_longer(self) -> None:
+        content = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+            "| zeta  | 2.3.4   | BSD        |\n"
+        )
+        expected = (
+            "| Name  | Version    | License    |\n"
+            "|-------|------------|------------|\n"
+            "| alpha | 1.0.0      | MIT        |\n"
+            "| mloda | 10.100.100 | Apache-2.0 |\n"
+            "| zeta  | 2.3.4      | BSD        |\n"
+        )
+        assert update_mloda_version(content, "10.100.100") == expected
+
+    def test_shrinks_version_column_when_old_version_was_the_widest_cell(self) -> None:
+        content = (
+            "| Name  | Version    | License    |\n"
+            "|-------|------------|------------|\n"
+            "| alpha | 1.0.0      | MIT        |\n"
+            "| mloda | 10.100.100 | Apache-2.0 |\n"
+            "| zeta  | 2.3.4      | BSD        |\n"
+        )
+        expected = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 1.0.0   | Apache-2.0 |\n"
+            "| zeta  | 2.3.4   | BSD        |\n"
+        )
+        assert update_mloda_version(content, "1.0.0") == expected
+
+    def test_idempotent_when_mloda_already_has_target_version(self) -> None:
+        content = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.11.0  | Apache-2.0 |\n"
+        )
+        assert update_mloda_version(content, "0.11.0") == content
+
+    def test_raises_value_error_when_mloda_row_is_missing(self) -> None:
+        content = (
+            "| Name  | Version | License |\n"
+            "|-------|---------|---------|\n"
+            "| alpha | 1.0.0   | MIT     |\n"
+            "| zeta  | 2.3.4   | BSD     |\n"
+        )
+        with pytest.raises(ValueError, match="mloda"):
+            update_mloda_version(content, "1.0.0")
+
+    def test_does_not_match_package_name_that_merely_contains_mloda(self) -> None:
+        content = (
+            "| Name         | Version | License    |\n"
+            "|--------------|---------|------------|\n"
+            "| mloda-plugin | 3.3.3   | MIT        |\n"
+            "| mloda        | 0.9.0   | Apache-2.0 |\n"
+        )
+        expected = (
+            "| Name         | Version | License    |\n"
+            "|--------------|---------|------------|\n"
+            "| mloda-plugin | 3.3.3   | MIT        |\n"
+            "| mloda        | 1.5.0   | Apache-2.0 |\n"
+        )
+        assert update_mloda_version(content, "1.5.0") == expected
+
+    def test_raises_clear_error_on_row_with_too_many_cells(self) -> None:
+        content = (
+            "| Name  | Version | License |\n"
+            "|-------|---------|---------|\n"
+            "| mloda | 1.0.0   | MIT     |\n"
+            "| weird | 1.0     | MIT | BSD |\n"
+        )
+        with pytest.raises(ValueError, match="cell"):
+            update_mloda_version(content, "1.0.0")
+
+    def test_raises_clear_error_on_row_with_too_few_cells(self) -> None:
+        content = (
+            "| Name  | Version | License |\n"
+            "|-------|---------|---------|\n"
+            "| mloda | 1.0.0   | MIT     |\n"
+            "| weird | 1.0     |\n"
+        )
+        with pytest.raises(ValueError, match="cell"):
+            update_mloda_version(content, "1.0.0")
+
+    def test_raises_clear_error_on_empty_content(self) -> None:
+        with pytest.raises(ValueError):
+            update_mloda_version("", "1.0.0")
+
+    def test_handles_multiple_trailing_blank_lines(self) -> None:
+        content = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+        )
+        single_trailing_newline = content
+        three_trailing_newlines = content + "\n\n"
+
+        result_single = update_mloda_version(single_trailing_newline, "1.0.0")
+        result_extra = update_mloda_version(three_trailing_newlines, "1.0.0")
+
+        assert result_single == result_extra
+
+
+class TestUpdateThirdPartyLicensesVersion:
+    def test_updates_only_the_mloda_version_line(self) -> None:
+        content = (
+            "Deprecated\n"
+            "1.2.15\n"
+            "MIT License\n"
+            "https://github.com/laurent-laporte-pro/deprecated\n"
+            "The MIT License (MIT)\n"
+            "\n"
+            "Copyright (c) 2017 Laurent LAPORTE\n"
+            "\n"
+            "Permission is hereby granted, free of charge, to any person obtaining a copy\n"
+            'of this software and associated documentation files (the "Software"), to deal\n'
+            "\n"
+            "SOFTWARE.\n"
+            "\n"
+            "mloda\n"
+            "0.10.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache License\n"
+            "\n"
+            "Version 2.0, January 2004\n"
+            "\n"
+            "END OF TERMS AND CONDITIONS\n"
+            "\n"
+            "Jinja2\n"
+            "3.1.5\n"
+            "BSD License\n"
+            "https://github.com/pallets/jinja/\n"
+            "Copyright 2007 Pallets\n"
+            "\n"
+            "Redistribution and use in source and binary forms.\n"
+        )
+        expected = content.replace("mloda\n0.10.0\n", "mloda\n0.11.0\n", 1)
+        assert update_third_party_licenses_version(content, "0.11.0") == expected
+
+    def test_works_when_mloda_is_first_block_in_file(self) -> None:
+        content = (
+            "mloda\n"
+            "0.10.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache License\n"
+            "\n"
+            "Version 2.0, January 2004\n"
+            "\n"
+            "Jinja2\n"
+            "3.1.5\n"
+            "BSD License\n"
+            "https://github.com/pallets/jinja/\n"
+            "Copyright 2007 Pallets\n"
+        )
+        expected = content.replace("mloda\n0.10.0\n", "mloda\n0.11.0\n", 1)
+        assert update_third_party_licenses_version(content, "0.11.0") == expected
+
+    def test_does_not_match_package_name_that_merely_contains_mloda(self) -> None:
+        content = (
+            "mloda-plugin\n"
+            "3.3.3\n"
+            "MIT License\n"
+            "https://github.com/mloda-ai/mloda-plugin\n"
+            "MIT license text.\n"
+            "\n"
+            "mloda\n"
+            "0.9.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache license text.\n"
+        )
+        expected = content.replace("mloda\n0.9.0\n", "mloda\n1.5.0\n", 1)
+        assert update_third_party_licenses_version(content, "1.5.0") == expected
+
+    def test_does_not_match_mloda_line_that_is_not_a_block_start(self) -> None:
+        content = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "Some license text mentions the word\n"
+            "mloda\n"
+            "in the middle of a paragraph, not as a package name.\n"
+        )
+        with pytest.raises(ValueError, match="mloda"):
+            update_third_party_licenses_version(content, "1.5.0")
+
+    def test_raises_value_error_when_no_mloda_block_exists(self) -> None:
+        content = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "MIT license text.\n"
+            "\n"
+            "zeta\n"
+            "2.3.4\n"
+            "BSD License\n"
+            "https://example.com/zeta\n"
+            "BSD license text.\n"
+        )
+        with pytest.raises(ValueError, match="mloda"):
+            update_third_party_licenses_version(content, "1.0.0")
+
+    def test_idempotent_when_mloda_already_has_target_version(self) -> None:
+        content = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "MIT license text.\n"
+            "\n"
+            "mloda\n"
+            "0.11.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache license text.\n"
+        )
+        assert update_third_party_licenses_version(content, "0.11.0") == content
+
+    def test_handles_multiple_trailing_blank_lines(self) -> None:
+        content = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "MIT license text.\n"
+            "\n"
+            "mloda\n"
+            "0.9.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache license text.\n"
+        )
+        single_trailing_newline = content
+        three_trailing_newlines = content + "\n\n"
+
+        result_single = update_third_party_licenses_version(single_trailing_newline, "1.0.0")
+        result_extra = update_third_party_licenses_version(three_trailing_newlines, "1.0.0")
+
+        expected_single = single_trailing_newline.replace("mloda\n0.9.0\n", "mloda\n1.0.0\n", 1)
+        expected_extra = three_trailing_newlines.replace("mloda\n0.9.0\n", "mloda\n1.0.0\n", 1)
+        assert result_single == expected_single
+        assert result_extra == expected_extra
+
+
+class TestRunSyncVersionCommand:
+    def test_writes_updated_attribution_file_at_default_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        attribution_dir = tmp_path / "attribution"
+        attribution_dir.mkdir()
+        original = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+        )
+        attribution_file = attribution_dir / "ATTRIBUTION.md"
+        attribution_file.write_text(original)
+
+        run_sync_version_command("2.0.0")
+
+        assert attribution_file.read_text() == update_mloda_version(original, "2.0.0")
+
+    def test_preserves_original_file_when_update_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        attribution_dir = tmp_path / "attribution"
+        attribution_dir.mkdir()
+        original = (
+            "| Name  | Version | License |\n"
+            "|-------|---------|---------|\n"
+            "| alpha | 1.0.0   | MIT     |\n"
+            "| zeta  | 2.3.4   | BSD     |\n"
+        )
+        attribution_file = attribution_dir / "ATTRIBUTION.md"
+        attribution_file.write_text(original)
+
+        with pytest.raises(ValueError):
+            run_sync_version_command("2.0.0")
+
+        assert attribution_file.read_text() == original
+
+    def test_no_error_and_no_third_party_file_created_when_third_party_file_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        attribution_dir = tmp_path / "attribution"
+        attribution_dir.mkdir()
+        original = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+        )
+        attribution_file = attribution_dir / "ATTRIBUTION.md"
+        attribution_file.write_text(original)
+
+        run_sync_version_command("2.0.0")
+
+        assert attribution_file.read_text() == update_mloda_version(original, "2.0.0")
+        assert not (attribution_dir / "THIRD_PARTY_LICENSES.md").exists()
+
+    def test_updates_both_attribution_and_third_party_licenses_when_both_exist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        attribution_dir = tmp_path / "attribution"
+        attribution_dir.mkdir()
+
+        original_attribution = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+        )
+        attribution_file = attribution_dir / "ATTRIBUTION.md"
+        attribution_file.write_text(original_attribution)
+
+        original_third_party = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "MIT license text.\n"
+            "\n"
+            "mloda\n"
+            "0.9.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache license text.\n"
+        )
+        third_party_file = attribution_dir / "THIRD_PARTY_LICENSES.md"
+        third_party_file.write_text(original_third_party)
+
+        run_sync_version_command("2.0.0")
+
+        assert attribution_file.read_text() == update_mloda_version(original_attribution, "2.0.0")
+        assert third_party_file.read_text() == update_third_party_licenses_version(original_third_party, "2.0.0")
+
+    def test_does_not_write_attribution_file_when_third_party_update_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        attribution_dir = tmp_path / "attribution"
+        attribution_dir.mkdir()
+
+        original_attribution = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+        )
+        attribution_file = attribution_dir / "ATTRIBUTION.md"
+        attribution_file.write_text(original_attribution)
+
+        malformed_third_party = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "MIT license text.\n"
+            "\n"
+            "zeta\n"
+            "2.3.4\n"
+            "BSD License\n"
+            "https://example.com/zeta\n"
+            "BSD license text.\n"
+        )
+        third_party_file = attribution_dir / "THIRD_PARTY_LICENSES.md"
+        third_party_file.write_text(malformed_third_party)
+
+        with pytest.raises(ValueError):
+            run_sync_version_command("2.0.0")
+
+        assert attribution_file.read_text() == original_attribution
+
+    def test_updates_third_party_file_next_to_a_non_default_attribution_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        custom_dir = tmp_path / "custom_dir"
+        custom_dir.mkdir()
+
+        original_attribution = (
+            "| Name  | Version | License    |\n"
+            "|-------|---------|------------|\n"
+            "| alpha | 1.0.0   | MIT        |\n"
+            "| mloda | 0.9.0   | Apache-2.0 |\n"
+        )
+        attribution_file = custom_dir / "ATTRIBUTION.md"
+        attribution_file.write_text(original_attribution)
+
+        original_third_party = (
+            "alpha\n"
+            "1.0.0\n"
+            "MIT License\n"
+            "https://example.com/alpha\n"
+            "MIT license text.\n"
+            "\n"
+            "mloda\n"
+            "0.9.0\n"
+            "Apache Software License\n"
+            "https://github.com/mloda-ai/mloda\n"
+            "Apache license text.\n"
+        )
+        third_party_file = custom_dir / "THIRD_PARTY_LICENSES.md"
+        third_party_file.write_text(original_third_party)
+
+        run_sync_version_command("2.0.0", path=str(attribution_file))
+
+        assert attribution_file.read_text() == update_mloda_version(original_attribution, "2.0.0")
+        assert third_party_file.read_text() == update_third_party_licenses_version(original_third_party, "2.0.0")
+
+
+class TestMain:
+    def test_main_with_no_args_runs_default_command(self) -> None:
+        from attribution.attributions import main
+
+        with (
+            patch("attribution.attributions.run_default_sync_command") as mock_default,
+            patch("attribution.attributions.run_sync_version_command") as mock_sync,
+        ):
+            main(["prog"])
+
+        mock_default.assert_called_once_with()
+        mock_sync.assert_not_called()
+
+    def test_main_dispatches_sync_version_to_handler(self) -> None:
+        from attribution.attributions import main
+
+        with (
+            patch("attribution.attributions.run_default_sync_command") as mock_default,
+            patch("attribution.attributions.run_sync_version_command") as mock_sync,
+        ):
+            main(["prog", "sync-version", "1.2.3"])
+
+        mock_sync.assert_called_once_with("1.2.3")
+        mock_default.assert_not_called()
+
+    def test_main_rejects_unknown_subcommand_without_running_default(self) -> None:
+        from attribution.attributions import main
+
+        with (
+            patch("attribution.attributions.run_default_sync_command") as mock_default,
+            patch("attribution.attributions.run_sync_version_command") as mock_sync,
+        ):
+            with pytest.raises(ValueError):
+                main(["prog", "bogus"])
+
+        mock_default.assert_not_called()
+        mock_sync.assert_not_called()
+
+    def test_main_rejects_sync_version_with_missing_argument(self) -> None:
+        from attribution.attributions import main
+
+        with (
+            patch("attribution.attributions.run_default_sync_command") as mock_default,
+            patch("attribution.attributions.run_sync_version_command") as mock_sync,
+        ):
+            with pytest.raises(ValueError):
+                main(["prog", "sync-version"])
+
+        mock_default.assert_not_called()
+        mock_sync.assert_not_called()
+
+    @pytest.mark.parametrize("empty_argument", ["", "   "])
+    def test_main_rejects_sync_version_with_empty_argument(self, empty_argument: str) -> None:
+        from attribution.attributions import main
+
+        with (
+            patch("attribution.attributions.run_default_sync_command") as mock_default,
+            patch("attribution.attributions.run_sync_version_command") as mock_sync,
+        ):
+            with pytest.raises(ValueError):
+                main(["prog", "sync-version", empty_argument])
+
+        mock_default.assert_not_called()
+        mock_sync.assert_not_called()

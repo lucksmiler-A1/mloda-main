@@ -1,0 +1,193 @@
+from abc import ABC
+from datetime import datetime
+from typing import Any
+
+from mloda.core.abstract_plugins.components.contract.comparison_contract import (
+    ColumnSemantics,
+    ComparisonContract,
+)
+from mloda.core.filter.single_filter import SingleFilter
+
+
+class BaseFilterEngine(ABC):
+    provides_column_semantics: bool = False
+
+    @classmethod
+    def final_filters(cls) -> bool:
+        """This function should return True if the filters should be applied after the feature calculation."""
+        return False
+
+    @classmethod
+    def apply_filters(cls, data: Any, features: Any) -> Any:
+        return cls.apply_single_filters(data, features)
+
+    @classmethod
+    def applicable_filters(cls, features: Any) -> list[SingleFilter]:
+        """Return the filters that apply_filters will actually process.
+
+        A filter is applicable when its column name appears in features.get_all_names().
+        This method is the single source of truth for that decision; both the filter
+        engine and the pre-elimination validator in ComputeFramework use it.
+        """
+        if features.filters is None:
+            return []
+        all_names = set(features.get_all_names())
+        return [sf for sf in features.filters if sf.filter_feature.name in all_names]
+
+    @classmethod
+    def apply_single_filters(cls, data: Any, features: Any) -> Any:
+        """This function should be used to apply filters to the data if filters are applied one by one."""
+        for single_filter in cls.applicable_filters(features):
+            data = cls.do_filter(data, single_filter)
+
+        return data
+
+    @classmethod
+    def do_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        if filter_feature.filter_type is None:
+            raise ValueError(f"Filter type evaluates to None {filter_feature.filter_feature.name}.")
+
+        if filter_feature.filter_type in ("range", "min", "max"):
+            cls._validate_temporal_filter_bounds(data, filter_feature)
+
+        if filter_feature.filter_type == "range":
+            return cls.do_range_filter(data, filter_feature)
+        elif filter_feature.filter_type == "min":
+            return cls.do_min_filter(data, filter_feature)
+        elif filter_feature.filter_type == "max":
+            return cls.do_max_filter(data, filter_feature)
+        elif filter_feature.filter_type == "equal":
+            return cls.do_equal_filter(data, filter_feature)
+        elif filter_feature.filter_type == "regex":
+            return cls.do_regex_filter(data, filter_feature)
+        elif filter_feature.filter_type == "categorical_inclusion":
+            return cls.do_categorical_inclusion_filter(data, filter_feature)
+        else:
+            return cls.do_custom_filter(data, filter_feature)
+
+    @classmethod
+    def do_range_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def do_min_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def do_max_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        column_name = filter_feature.name
+
+        # Check if this is a complex parameter with max/max_exclusive or a simple one with value
+        has_max = filter_feature.parameter.max_value is not None
+        has_value = filter_feature.parameter.value is not None
+
+        if has_max:
+            # Complex parameter - use get_min_max_operator
+            min_parameter, max_parameter, max_operator = cls.get_min_max_operator(filter_feature)
+
+            if min_parameter is not None:
+                raise ValueError(
+                    f"Filter parameter {filter_feature.parameter} not supported as max filter: {filter_feature.name}"
+                )
+
+            if max_parameter is None:
+                raise ValueError(
+                    f"Filter parameter {filter_feature.parameter} is None although expected: {filter_feature.name}"
+                )
+
+            if max_operator is True:
+                return cls._apply_max_exclusive_filter(data, column_name, max_parameter)
+            return cls._apply_max_inclusive_filter(data, column_name, max_parameter)
+        elif has_value:
+            # Simple parameter - extract the value
+            value = filter_feature.parameter.value
+            if value is None:
+                raise ValueError(f"Filter parameter 'value' not found in {filter_feature.parameter}")
+            return cls._apply_max_inclusive_filter(data, column_name, value)
+        else:
+            raise ValueError(f"No valid filter parameter found in {filter_feature.parameter}")
+
+    @classmethod
+    def _apply_max_exclusive_filter(cls, data: Any, column_name: str, threshold: Any) -> Any:
+        """Keep rows where column_name < threshold."""
+        raise NotImplementedError
+
+    @classmethod
+    def _apply_max_inclusive_filter(cls, data: Any, column_name: str, threshold: Any) -> Any:
+        """Keep rows where column_name <= threshold."""
+        raise NotImplementedError
+
+    @classmethod
+    def do_equal_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def do_regex_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def do_categorical_inclusion_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def do_custom_filter(cls, data: Any, filter_feature: SingleFilter) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def _column_semantics(cls, data: Any, column: str) -> ColumnSemantics:
+        """Observed semantics of a column, used by the temporal filter-bound guard.
+
+        Opt-in hook (Option B, epic #518): the temporal filter-bound guard only calls
+        this when the engine sets ``provides_column_semantics = True``. An engine that
+        opts in promises to expose its framework-native ColumnSemantics; the base raises
+        NotImplementedError so a forgotten override fails loudly.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} must implement _column_semantics(data, column) "
+            f"to support timezone validation for temporal filters."
+        )
+
+    @classmethod
+    def _validate_temporal_filter_bounds(cls, data: Any, filter_feature: SingleFilter) -> None:
+        """Guard that native datetime range/min/max bounds match the column's tz-awareness.
+
+        The guard is opt-in (Option B, epic #518): it is skipped entirely unless the
+        engine sets ``provides_column_semantics = True``, so a time-agnostic filter engine
+        author is never forced to implement ``_column_semantics``. When opted in, it only
+        reads column semantics when a bound is actually a ``datetime`` (pandas
+        ``Timestamp`` is a ``datetime`` subclass, so it is included). Numeric/string
+        filters never touch ``_column_semantics``. ``require_compatible`` no-ops unless
+        both the column and the bound are temporal, so non-temporal columns are not
+        falsely flagged.
+        """
+        if not cls.provides_column_semantics:
+            return
+
+        param = filter_feature.parameter
+        candidates = [param.value, param.min_value, param.max_value]
+        datetime_bounds = [b for b in candidates if isinstance(b, datetime)]
+        if not datetime_bounds:
+            return
+
+        column = filter_feature.name
+        col_sem = cls._column_semantics(data, column)
+        contract = ComparisonContract(required=frozenset())
+        for bound in datetime_bounds:
+            bound_sem = ColumnSemantics(
+                is_ordered=True,
+                is_temporal=True,
+                is_numeric=False,
+                unit=None,
+                is_tz_aware=bound.tzinfo is not None,
+            )
+            contract.require_compatible(col_sem, bound_sem, column, "filter bound")
+
+    @classmethod
+    def get_min_max_operator(cls, filter_feature: SingleFilter) -> Any:
+        """Convenience method to get min, max, and max operator from filter parameters"""
+
+        min_parameter = filter_feature.parameter.min_value
+        max_parameter = filter_feature.parameter.max_value
+        is_max_exclusive = filter_feature.parameter.max_exclusive
+
+        return min_parameter, max_parameter, is_max_exclusive

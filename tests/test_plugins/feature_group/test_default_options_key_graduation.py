@@ -1,0 +1,56 @@
+"""Tests for DefaultOptionKeys graduation into mloda core."""
+
+
+class TestDefaultOptionKeysCoreLocation:
+    """Verify DefaultOptionKeys lives in mloda core and is importable from mloda.provider."""
+
+    def test_import_from_core(self) -> None:
+        from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+
+        assert DefaultOptionKeys is not None
+
+    def test_import_from_provider(self) -> None:
+        from mloda.provider import DefaultOptionKeys
+
+        assert DefaultOptionKeys is not None
+
+    def test_all_keys_exist(self) -> None:
+        from mloda.provider import DefaultOptionKeys
+
+        expected_keys = [
+            "in_features",
+            "reference_time",
+            "time_travel",
+            "context",
+            "group",
+            "order_by",
+            "strict_type_enforcement",
+        ]
+        for key in expected_keys:
+            assert hasattr(DefaultOptionKeys, key), f"Missing key: {key}"
+
+    def test_values_match(self) -> None:
+        from mloda.provider import DefaultOptionKeys
+
+        assert DefaultOptionKeys.reference_time.value == "reference_time"
+        assert DefaultOptionKeys.time_travel.value == "time_travel"
+        assert DefaultOptionKeys.group.value == "group"
+        assert DefaultOptionKeys.order_by.value == "order_by"
+
+    def test_all_member_names_match_values(self) -> None:
+        """Every enum member's name must equal its value to prevent silent mismatches.
+
+        See: https://github.com/mloda-ai/mloda/issues/271
+        """
+        from mloda.provider import DefaultOptionKeys
+
+        for member in DefaultOptionKeys:
+            assert member.name == member.value, (
+                f"DefaultOptionKeys.{member.name} has value {member.value!r}; name and value must be identical"
+            )
+
+    def test_core_and_provider_same_class(self) -> None:
+        from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys as Core
+        from mloda.provider import DefaultOptionKeys as Provider
+
+        assert Core is Provider

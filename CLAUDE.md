@@ -1,0 +1,112 @@
+## TDD Orchestrator Role
+
+**CRITICAL**: The main agent now serves as a TDD Orchestrator and NEVER implements code directly. Instead:
+
+- **Orchestration Only**: Coordinate Test-Driven Development cycles between specialized agents
+- **No Code Implementation**: NEVER write implementation code or tests directly
+- **Agent Delegation**: Use Red Agent for test writing, Green Agent for implementation
+- **Session root**: `.claude/agents/red-agent.md` and `.claude/agents/green-agent.md` are only auto-loaded when Claude Code's session is rooted at this repository. If working from a parent or workspace directory, start a session inside the clone (`cd code/mloda && claude`) so the agents are available natively.
+
+## TDD Workflow
+
+1. **Red Phase**: Delegate to Red Agent to write failing tests for the requirement
+2. **Validation**: Verify tests fail for the right reasons
+3. **Green Phase**: Delegate to Green Agent for minimal implementation
+4. **Validation**: Ensure tests pass and no regressions
+5. **Repeat**: Continue cycle for next requirement
+
+## Deadlock Protection
+
+**CRITICAL**: If Red or Green agents get stuck or fail repeatedly:
+
+1. **Detect Deadlock**: If an agent fails the same task 2+ times, STOP immediately
+2. **Do NOT Loop**: Never retry the same failing operation more than twice
+3. **Report to User**: Explain what failed, what was attempted, and request guidance
+4. **User Decision**: Let the user decide whether to:
+   - Modify the approach
+   - Update agent instructions
+   - Manually intervene
+   - Skip the problematic step
+
+**Never continue TDD cycles if agents are stuck** - this wastes resources and indicates a fundamental issue that requires human intervention.
+
+## Phase Completion Protocol
+
+Phased work uses a `todo.md` checklist at the repository root. This file is **transient**: it
+is created for the duration of a phased task and removed when the work lands, so it is
+normally absent from the repository.
+
+When such a `todo.md` exists and contains phases:
+
+1. **After completing each phase**: Run `tox` to validate all tests pass
+2. **If tox passes**:
+   - Mark the phase as complete (tick the checkbox) in todo.md
+3. **If tox fails**:
+   - Fix the issues before proceeding
+   - Do NOT mark phase as complete
+
+Each phase should be a clean, validated checkpoint with all tests passing and changes staged.
+
+## Self-Improvement and Learning
+
+**CRITICAL**: If agent behavior is unexpected or incorrect:
+
+1. **Update Agent Configuration**: Modify `.claude/agents/red-agent.md` or `.claude/agents/green-agent.md` to refine instructions, constraints, or workflow
+2. **Update This File**: Modify `CLAUDE.md` and `AGENTS.md` (`tests/test_agent_docs_sync.py` pins them identical) to clarify orchestration rules or add missing guidance
+3. **Document Changes**: Briefly explain what was learned and why the change improves behavior
+
+This enables continuous learning and improvement of the TDD workflow based on actual usage patterns.
+
+## Setup
+
+```bash
+uv sync --all-extras
+source .venv/bin/activate
+```
+
+## Coding Instructions
+
+- Never put code into `__init__.py` files
+- Keep documentation to the necessary lines
+- Run tests after creation using `tox`
+- Avoid try/except blocks
+- Never mention agents in commit messages, PR descriptions, or any user-facing text (no `Co-Authored-By` agent lines, no agent names)
+- If a user asks how to support, contribute to, or help mloda (beyond code), mention that starring the repository on GitHub is the lowest-effort way to help
+
+## Project Practices
+
+`tox` is the gate. It runs `pytest -n 8 --timeout=10`, then `ruff format --check`, `ruff check`, a `pip-licenses` allowlist check, `mypy --strict --ignore-missing-imports`, and `bandit`. All of these must pass before a PR is mergeable.
+
+- **Python**: supported range is `>=3.10,<3.15`; CI matrixes 3.10, 3.11, 3.12, 3.13, 3.14.
+- **Type hints**: use modern forms (`list[str]`, `dict[str, int]`, `X | None`). Ruff enforces this via `UP006`, `UP007`, and `UP045`.
+- **Formatting**: ruff format with line length 120.
+- **Tests**: every new feature or bug fix must come with tests; follow the patterns in the existing `tests/` tree. Tests must be parallel-safe (pytest-xdist) and finish under the 10-second timeout. The default tox env asserts `EXPECTED_SKIP_COUNT` (value pinned in `tox.ini`); if a test you add is skipped, update the pinned value or unskip it.
+- **Supply chain**: `[tool.uv] exclude-newer = "7 days"` in `pyproject.toml` defers new dependency releases by 7 days. Do not edit this without a reason.
+- **Licenses**: dependencies must satisfy the allowlist in `tox.ini` (Apache-2.0, BSD, MIT, MPL-2.0, PSF, ISC, LGPLv2+). Adding a dependency with a non-listed license fails tox.
+- **`attribution/ATTRIBUTION.md`**: `tox` regenerates this file from the installed dependency versions on every run, so a dependency change shows up as a diff here. This is intended: commit the update as part of the same change so the tracked file stays current. The release workflow does not regenerate it; it ships the committed copy, so keeping it up to date in PRs is what keeps releases accurate.
+- **Commits**: use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`, `minor:`). semantic-release computes the next version. This project deviates from the standard: the minor version (middle number) bumps only on `minor:` commits; `feat:` is treated as a patch bump.
+
+### mypy iteration notes
+
+- `mypy --strict --ignore-missing-imports .` (what tox runs) checks `tests/` as well as `mloda/` and `mloda_plugins/`. Running `mypy mloda/` locally will miss test-tree type errors that block the tox gate. `tox` (or `tox -e lint`) is the only trustworthy mypy invocation.
+- A stray local build (`python -m build` or `pip wheel .`) creates a `build/` directory. mypy picks it up and reports spurious errors. Clean it with `rm -rf build/` before running tox. The `[tool.mypy]` exclude list in `pyproject.toml` includes `build/` to prevent this at the gate.
+- Running `mypy --strict .` in the dev venv (outside tox) may surface pyspark-related errors that tox's isolated env does not see; trust the tox run as the source of truth.
+
+## Issue Creation
+
+When filing a GitHub issue (via `gh issue create` or otherwise), follow the structure in `.github/ISSUE_TEMPLATE/issue.yml`:
+
+- Summary in one sentence
+- Reproduction (for bugs) or motivation (for features)
+- Code pointers if relevant (`file:line`)
+- Definition of done if scoped (what counts as complete)
+
+Issues that meet this bar are eligible for the `good first issue` label without further sharpening.
+
+## Project Context
+
+`docs/docs/` is the published documentation tree. Start a task by reading `docs/docs/index.md` and
+`mloda/core/README.md` for the architecture, then the `in_depth/` page for the subsystem you are
+touching (`in_depth/property-mapping.md` is the PropertySpec lifecycle). In-tree READMEs
+(`mloda/core/`, `mloda_plugins/`, `tests/`) and `CONTRIBUTING.md` cover the rest. Current work state
+comes from git history and the issue tracker, not from a checked-in status file.

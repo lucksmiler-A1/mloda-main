@@ -1,0 +1,402 @@
+"""
+Base implementation for time window feature groups.
+"""
+
+from __future__ import annotations
+
+import datetime
+from abc import abstractmethod
+from typing import Any, cast
+
+from mloda.provider import FeatureGroup
+from mloda.user import Feature
+from mloda.provider import (
+    FeatureChainParser,
+    FeatureChainParserMixin,
+)
+from mloda.provider import COLUMN_DISCOVERY_HOOKS
+from mloda.user import FeatureName
+from mloda.provider import FeatureSet
+from mloda.user import Options
+from mloda.provider import DefaultOptionKeys
+from mloda.provider import PropertySpec, is_positive_int
+from mloda_plugins.feature_group.experimental.time_reference_mixin import TimeReferenceMixin
+
+
+class TimeWindowFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, FeatureGroup):
+    """
+    Base class for all time window feature groups.
+
+    Time window feature groups calculate rolling window operations over time series data.
+    They allow you to compute metrics like moving averages, rolling maximums, or cumulative
+    sums over specified time periods.
+
+    ## Feature Naming Convention
+
+    Time window features follow this naming pattern:
+    `{in_features}__{window_function}_{window_size}_{time_unit}_window`
+
+    The source feature (in_features) comes first, followed by the window operation.
+    Note the double underscore separating the source feature from the operation.
+
+    Examples:
+    - `temperature__avg_7_day_window`: 7-day moving average of temperature
+    - `cpu_usage__max_3_hour_window`: 3-hour rolling maximum of CPU usage
+    - `transactions__sum_30_minute_window`: 30-minute cumulative sum of transactions
+
+    ## Supported Window Functions
+
+    - `sum`: Sum of values in the window
+    - `min`: Minimum value in the window
+    - `max`: Maximum value in the window
+    - `avg`/`mean`: Average (mean) of values in the window
+    - `count`: Count of non-null values in the window
+    - `std`: Standard deviation of values in the window
+    - `var`: Variance of values in the window
+    - `median`: Median value in the window
+    - `first`: First value in the window
+    - `last`: Last value in the window
+
+    ## Supported Time Units
+
+    - `second`: Seconds
+    - `minute`: Minutes
+    - `hour`: Hours
+    - `day`: Days
+    - `week`: Weeks
+    - `month`: Months
+    - `year`: Years
+
+    ## Requirements
+    - The input data must have a datetime column that can be used for time-based operations
+    - By default, the feature group will use DefaultOptionKeys.reference_time (default: "reference_time")
+    - You can specify a custom time column by setting the reference_time option in the feature group options
+
+    """
+
+    # Option keys for time window configuration
+    WINDOW_FUNCTION = "window_function"
+    WINDOW_SIZE = "window_size"
+    TIME_UNIT = "time_unit"
+
+    # Define supported window functions
+    WINDOW_FUNCTIONS = {
+        "sum": "Sum of values in window",
+        "min": "Minimum value in window",
+        "max": "Maximum value in window",
+        "avg": "Average (mean) of values in window",
+        "mean": "Average (mean) of values in window",
+        "count": "Count of non-null values in window",
+        "std": "Standard deviation of values in window",
+        "var": "Variance of values in window",
+        "median": "Median value in window",
+        "first": "First value in window",
+        "last": "Last value in window",
+    }
+
+    # Define PROPERTY_MAPPING for the new unified parser approach
+    PROPERTY_MAPPING = {
+        WINDOW_FUNCTION: PropertySpec(
+            "Window function to apply over the time window",
+            allowed_values=WINDOW_FUNCTIONS,
+            context=True,
+            strict_validation=True,
+        ),
+        WINDOW_SIZE: PropertySpec(
+            "Size of the time window (must be positive integer)",
+            context=True,
+            strict_validation=True,
+            element_validator=is_positive_int,
+        ),
+        TIME_UNIT: PropertySpec(
+            "Time unit of the window size",
+            allowed_values=TimeReferenceMixin.TIME_UNITS,
+            context=True,
+            strict_validation=True,
+        ),
+        DefaultOptionKeys.in_features: PropertySpec(
+            "Source feature to apply time window operation to",
+            context=True,
+            strict_validation=False,
+        ),
+        DefaultOptionKeys.reference_time: TimeReferenceMixin.REFERENCE_TIME_SPEC,
+    }
+
+    # Named captures bind window_function/window_size/time_unit; core validates them at match time.
+    PREFIX_PATTERN = r".*__(?P<window_function>[\w]+)_(?P<window_size>\d+)_(?P<time_unit>[\w]+)_window$"
+
+    # In-feature configuration for FeatureChainParserMixin
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+
+    # Hooks calculate_feature calls: _get_available_columns, _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMN_DISCOVERY_HOOKS
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        """Source features from the shared resolution plus the reference-time feature."""
+        source_features = super().input_features(options, feature_name) or set()
+        return source_features | {Feature(self.get_reference_time_column(options))}
+
+    @classmethod
+    def _has_valid_time_window_suffix(cls, feature_name: str) -> bool:
+        """Check if feature_name has a suffix matching the time window pattern."""
+        parsed = FeatureChainParser.parse_name(feature_name, cls._get_prefix_patterns())
+        if not parsed.matched:
+            return False
+        captures = cast(dict[str, str], parsed.named_captures)
+        if captures[cls.WINDOW_FUNCTION] not in cls.WINDOW_FUNCTIONS:
+            return False
+        if captures[cls.TIME_UNIT] not in cls.TIME_UNITS:
+            return False
+        return int(captures[cls.WINDOW_SIZE]) > 0
+
+    @classmethod
+    def _extract_time_window_params(cls, feature: Feature) -> tuple[str | None, int | None, str | None]:
+        """
+        Extract time window parameters (window_function, window_size, time_unit) from a feature.
+
+        Resolves each parameter from the feature name first, then from options.
+
+        Args:
+            feature: The feature to extract parameters from
+
+        Returns:
+            Tuple of (window_function, window_size, time_unit), where any value may be None if not found
+        """
+        window_function = cls._resolve_operation(feature, cls.WINDOW_FUNCTION)
+        window_size: Any = cls._resolve_operation(feature, cls.WINDOW_SIZE)
+        time_unit = cls._resolve_operation(feature, cls.TIME_UNIT)
+
+        if window_size is not None:
+            window_size = int(window_size)
+
+        return window_function, window_size, time_unit
+
+    @classmethod
+    def _extract_time_window_params_and_source_features(cls, feature: Feature) -> tuple[str, int, str, str]:
+        """
+        Extract time window parameters and source feature from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract parameters from
+
+        Returns:
+            Tuple of (window_function, window_size, time_unit, source_feature_name)
+
+        Raises:
+            ValueError: If parameters cannot be extracted
+        """
+        window_function, window_size, time_unit = cls._extract_time_window_params(feature)
+
+        if window_function is None or window_size is None or time_unit is None:
+            raise ValueError(f"Could not extract time window parameters from: {feature.name}")
+
+        return window_function, window_size, time_unit, cls._extract_single_source_feature(feature)
+
+    @classmethod
+    def parse_time_window_prefix(cls, feature_name: str) -> tuple[str, int, str]:
+        """
+        Parse the time window suffix into its components.
+
+        Args:
+            feature_name: The feature name to parse
+
+        Returns:
+            A tuple containing (window_function, window_size, time_unit)
+
+        Raises:
+            ValueError: If the suffix doesn't match the expected pattern
+        """
+        parsed = FeatureChainParser.parse_name(feature_name, cls._get_prefix_patterns())
+        if not parsed.matched:
+            raise ValueError(
+                f"Invalid time window feature name format: {feature_name}. "
+                f"Expected format: {{in_features}}__{{window_function}}_{{window_size}}_{{time_unit}}_window"
+            )
+
+        captures = cast(dict[str, str], parsed.named_captures)
+        window_function = captures[cls.WINDOW_FUNCTION]
+        window_size_str = captures[cls.WINDOW_SIZE]
+        time_unit = captures[cls.TIME_UNIT]
+
+        # Validate window function
+        if window_function not in cls.WINDOW_FUNCTIONS:
+            raise ValueError(
+                f"Unsupported window function: {window_function}. "
+                f"Supported functions: {', '.join(cls.WINDOW_FUNCTIONS.keys())}"
+            )
+
+        # Validate time unit
+        if time_unit not in cls.TIME_UNITS:
+            raise ValueError(f"Unsupported time unit: {time_unit}. Supported units: {', '.join(cls.TIME_UNITS.keys())}")
+
+        # Convert window size to integer
+        if int(window_size_str) <= 0:
+            raise ValueError(f"Invalid window size: {window_size_str}. Must be a positive integer.")
+        window_size = int(window_size_str)
+
+        return window_function, window_size, time_unit
+
+    @classmethod
+    def get_window_function(cls, feature_name: str) -> str:
+        """Extract the window function from the feature name."""
+        return cls.parse_time_window_prefix(feature_name)[0]
+
+    @classmethod
+    def get_window_size(cls, feature_name: str) -> int:
+        """Extract the window size from the feature name."""
+        return cls.parse_time_window_prefix(feature_name)[1]
+
+    @classmethod
+    def get_time_unit(cls, feature_name: str) -> str:
+        """Extract the time unit from the feature name."""
+        return cls.parse_time_window_prefix(feature_name)[2]
+
+    @classmethod
+    def _get_time_delta(cls, window_size: int, time_unit: str) -> datetime.timedelta:
+        """
+        Convert window size and time unit into the window span as a timedelta.
+
+        Shared by both backends so the time-based window is IDENTICAL across them.
+        week/month/year use fixed day approximations (7 / 30 / 365 days).
+        """
+        if time_unit == "second":
+            return datetime.timedelta(seconds=window_size)
+        elif time_unit == "minute":
+            return datetime.timedelta(minutes=window_size)
+        elif time_unit == "hour":
+            return datetime.timedelta(hours=window_size)
+        elif time_unit == "day":
+            return datetime.timedelta(days=window_size)
+        elif time_unit == "week":
+            return datetime.timedelta(weeks=window_size)
+        elif time_unit == "month":
+            return datetime.timedelta(days=30 * window_size)
+        elif time_unit == "year":
+            return datetime.timedelta(days=365 * window_size)
+        else:
+            raise ValueError(f"Unsupported time unit: {time_unit}")
+
+    @classmethod
+    def _raise_null_reference_time(cls, reference_time_column: str) -> None:
+        """Raise a uniform ValueError when the reference time column contains null/NaT values."""
+        raise ValueError(
+            f"Reference time column '{reference_time_column}' contains null values. "
+            f"Time window operations require non-null reference times."
+        )
+
+    # match_feature_group_criteria() inherited from FeatureChainParserMixin
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        """
+        Perform time window operations.
+
+        Processes all requested features, determining the window function, window size,
+        time unit, and source feature from each feature name.
+
+        Supports multi-column features by using resolve_multi_column_feature() to
+        automatically discover columns matching the pattern feature_name~N.
+
+        Adds the time window results directly to the input data structure.
+        """
+
+        _options = None
+        for feature in features.get_sorted_features():
+            if _options:
+                if _options != feature.options:
+                    raise ValueError("All features must have the same options.")
+            _options = feature.options
+
+        reference_time_column = cls.get_reference_time_column(_options)
+
+        cls._check_reference_time_column_exists(data, reference_time_column)
+
+        cls._check_reference_time_column_is_datetime(data, reference_time_column)
+
+        # Process each requested feature
+        for feature in features.get_sorted_features():
+            window_function, window_size, time_unit, in_features = cls._extract_time_window_params_and_source_features(
+                feature
+            )
+
+            # Resolve multi-column features automatically
+            # If in_features is "onehot_encoded__product", this discovers
+            # ["onehot_encoded__product~0", "onehot_encoded__product~1", ...]
+            available_columns = cls._get_available_columns(data)
+            resolved_columns = cls.resolve_multi_column_feature(in_features, available_columns)
+
+            # Check that resolved columns exist
+            cls._check_source_features_exist(data, resolved_columns)
+
+            result = cls._perform_window_operation(
+                data, window_function, window_size, time_unit, resolved_columns, reference_time_column
+            )
+
+            data = cls._add_result_to_data(data, feature.name, result)
+
+        return data
+
+    @classmethod
+    @abstractmethod
+    def _check_reference_time_column_exists(cls, data: Any, reference_time_column: str) -> None:
+        """
+        Check if the reference time column exists in the data.
+
+        Args:
+            data: The input data
+            reference_time_column: The name of the reference time column
+
+        Raises:
+            ValueError: If the reference time column does not exist in the data
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def _check_reference_time_column_is_datetime(cls, data: Any, reference_time_column: str) -> None:
+        """
+        Check if the reference time column is a datetime column.
+
+        Args:
+            data: The input data
+            reference_time_column: The name of the reference time column
+
+        Raises:
+            ValueError: If the reference time column is not a datetime column
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def _perform_window_operation(
+        cls,
+        data: Any,
+        window_function: str,
+        window_size: int,
+        time_unit: str,
+        in_features: list[str],
+        time_filter_feature: str | None = None,
+    ) -> Any:
+        """
+        Method to perform the time window operation. Should be implemented by subclasses.
+
+        Supports both single-column and multi-column window operations:
+        - Single column: [feature_name] - performs window operation on the column
+        - Multi-column: [feature~0, feature~1, ...] - performs window operation across columns
+
+        Args:
+            data: The input data
+            window_function: The type of window function to perform
+            window_size: The size of the window
+            time_unit: The time unit for the window
+            in_features: List of resolved source feature names to perform window operation on
+            time_filter_feature: The name of the time filter feature to use for time-based operations.
+                                If None, uses the value from get_reference_time_column().
+
+        Returns:
+            The result of the window operation
+        """
+        ...

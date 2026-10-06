@@ -1,0 +1,178 @@
+# Multiple Result Columns
+
+## Overview
+
+Feature groups in mloda can return multiple related columns using a naming convention pattern. This allows for more flexible and powerful feature engineering, especially when a single feature computation produces multiple related outputs.
+
+## Naming Convention
+
+The naming convention for multiple result columns follows this pattern:
+
+```
+feature_name~column_suffix
+```
+
+Where:
+- `feature_name` is the base name of the feature
+- `~` is the separator character
+- `column_suffix` is a unique identifier for each related column
+
+## Example
+
+A feature group that computes statistical properties might return multiple columns:
+
+```
+temperature~mean
+temperature~min
+temperature~max
+temperature~std
+```
+
+## Implementation
+
+### Returning Multiple Columns
+
+When implementing a feature group that returns multiple columns:
+
+```py
+class MultiColumnFeatureGroup(FeatureGroup):
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        feature_name = str(features.get_name_of_one_feature())
+        
+        # Return multiple columns with the naming convention
+        return {
+            f"{feature_name}~mean": [1, 2, 3],
+            f"{feature_name}~max": [4, 5, 6],
+            f"{feature_name}~min": [0, 1, 2]
+        }
+```
+
+### Consuming Multiple Columns
+
+#### Automatic Column Discovery (Recommended)
+
+Use the `resolve_multi_column_feature()` utility to automatically discover all columns matching the pattern:
+
+```py
+class MultiColumnConsumer(FeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature.not_typed("MultiColumnFeature")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        # Automatically discover all columns matching the pattern
+        columns = cls.resolve_multi_column_feature(
+            "MultiColumnFeature",
+            set(data.columns)
+        )
+        # Returns: ["MultiColumnFeature~mean", "MultiColumnFeature~max", "MultiColumnFeature~min"]
+
+        # Process all discovered columns
+        result = sum(data[col] for col in columns)
+
+        feature_name = str(features.get_name_of_one_feature())
+        return {feature_name: result}
+```
+
+**Benefits**:
+- No need to manually enumerate column names
+- Automatically adapts if number of columns changes
+- Cleaner, more maintainable code
+
+#### Manual Column Access (Legacy)
+
+For backwards compatibility, you can still access columns manually:
+
+```py
+class MultiColumnConsumer(FeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {Feature.not_typed("MultiColumnFeature")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        # Manual access to specific columns
+        mean_values = data["MultiColumnFeature~mean"]
+        max_values = data["MultiColumnFeature~max"]
+
+        # Perform calculations using these columns
+        result = mean_values + max_values
+
+        feature_name = str(features.get_name_of_one_feature())
+        return {feature_name: result}
+```
+
+#### Specific Sub-Column Dependency
+
+You can declare a dependency on a specific sub-column directly, without needing all columns:
+
+```py
+class SpecificSubColumnConsumer(FeatureGroup):
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        # Depend on ONLY base_feature~1, not all columns
+        return {Feature("base_feature~1")}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        # Only base_feature~1 is available
+        values = data["base_feature~1"]
+
+        feature_name = str(features.get_name_of_one_feature())
+        return {feature_name: values * 10}
+```
+
+**Benefits**:
+
+- No need for pass-through FeatureGroups
+- Clearer dependency declarations
+- Only pulls the specific column needed
+
+**Behavior Summary**:
+
+- `Feature("base_feature")` → Returns ALL columns: `base_feature~0`, `base_feature~1`, etc.
+- `Feature("base_feature~1")` → Returns ONLY `base_feature~1` column
+
+## How It Works
+
+The mloda framework automatically handles the selection of columns that follow this naming convention:
+
+1. When a feature group requests a feature by name, the framework identifies all columns that either:
+   - Match the feature name exactly, or
+   - Follow the pattern `feature_name~suffix`
+
+2. This is implemented in the `identify_naming_convention` method in the `ComputeFramework` class:
+
+```py
+def identify_naming_convention(
+    self,
+    selected_feature_names: Sequence[FeatureName],
+    column_names: set[str],
+    ordering: str | None = None,
+    request_feature_order: list[str] | None = None,
+) -> set[str] | list[str]: ...
+```
+
+It collects every column that equals a requested feature name or starts with `feature_name~`, and raises a `ValueError` if no column matches. By default it returns a set; with `ordering="alphabetical"` it returns a sorted list, and with `ordering="request_order"` it returns a list ordered by `request_feature_order` (falling back to `selected_feature_names`). Any other `ordering` value raises a `ValueError`.
+
+## Best Practices
+
+1. **Use Automatic Discovery**: Prefer `resolve_multi_column_feature()` over manual column enumeration when you need all columns
+2. **Use Specific Sub-Column Dependencies**: When you only need one sub-column, use `Feature("base_feature~N")` for clearer intent and efficiency
+3. **Consistent Naming**: Use consistent suffixes across related feature groups
+4. **Use `apply_naming_convention()`**: When producing multi-column outputs, use the utility for consistency
+5. **Documentation**: Document the meaning of each suffix in your feature group's docstring
+6. **Validation**: Consider validating that all expected columns are present when consuming multiple columns
+7. **Error Handling**: Handle cases where expected columns might be missing
+
+## Available Utilities
+
+mloda provides several utilities for working with multi-column features:
+
+| Method | Purpose | Use Case |
+|--------|---------|----------|
+| `apply_naming_convention(result, feature_name)` | Create multi-column outputs | Producer: Generate `~N` suffixed columns from arrays |
+| `resolve_multi_column_feature(feature_name, columns)` | Discover multi-column inputs | Consumer: Auto-find all `~N` columns |
+| `expand_feature_columns(feature_name, num_columns)` | Generate column name list | Producer: Pre-generate expected column names |
+| `get_column_base_feature(column_name)` | Strip trailing `~N` suffix from column | Both: Extract base feature from `feature~N` (last `~` wins) |
+
+**Note**: When declaring dependencies with `Feature("base_feature~N")`, the framework automatically resolves to the parent FeatureGroup that produces `base_feature` and extracts only the specified sub-column. Only a numeric suffix is recognized this way: `get_column_base_feature` does not strip a non-digit suffix such as `~mean` or `~dim1` back to its base, so a feature name like `Feature("base_feature~mean")` will NOT resolve to the producing FeatureGroup as a formal sub-column dependency.

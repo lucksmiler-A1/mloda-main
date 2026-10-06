@@ -1,0 +1,204 @@
+from decimal import Decimal
+
+import pytest
+
+from mloda_plugins.compute_framework.base_implementations.sql.sql_utils import (
+    ensure_distinct_identifiers,
+    fold_identifier,
+    inline_params,
+    pick_helper_column_name,
+    pick_rename_prefix,
+    quote_ident,
+    quote_value,
+)
+
+
+class TestQuoteIdent:
+    def test_simple_name(self) -> None:
+        assert quote_ident("col") == '"col"'
+
+    def test_embedded_double_quote(self) -> None:
+        assert quote_ident('col"name') == '"col""name"'
+
+    def test_name_with_spaces(self) -> None:
+        assert quote_ident("my col") == '"my col"'
+
+    def test_name_with_special_chars(self) -> None:
+        assert quote_ident("a.b") == '"a.b"'
+
+
+class TestQuoteValue:
+    def test_none(self) -> None:
+        assert quote_value(None) == "NULL"
+
+    def test_true(self) -> None:
+        assert quote_value(True) == "1"
+
+    def test_false(self) -> None:
+        assert quote_value(False) == "0"
+
+    def test_integer(self) -> None:
+        assert quote_value(42) == "42"
+
+    def test_negative_integer(self) -> None:
+        assert quote_value(-5) == "-5"
+
+    def test_float(self) -> None:
+        assert quote_value(3.14) == "3.14"
+
+    def test_decimal(self) -> None:
+        assert quote_value(Decimal("12.34")) == "12.34"
+        assert quote_value(Decimal("-0.50")) == "-0.50"
+        assert quote_value(Decimal("100")) == "100"
+
+    def test_decimal_exponent_form_is_positional(self) -> None:
+        assert quote_value(Decimal("1E+2")) == "100"
+
+    def test_decimal_nan_raises(self) -> None:
+        with pytest.raises(ValueError):
+            quote_value(Decimal("NaN"))
+
+    def test_decimal_infinity_raises(self) -> None:
+        with pytest.raises(ValueError):
+            quote_value(Decimal("Infinity"))
+
+    def test_string(self) -> None:
+        assert quote_value("hello") == "'hello'"
+
+    def test_string_with_single_quote(self) -> None:
+        assert quote_value("it's") == "'it''s'"
+
+    def test_string_with_sql_injection(self) -> None:
+        assert quote_value("'; DROP TABLE users; --") == "'''; DROP TABLE users; --'"
+
+    def test_inf_raises(self) -> None:
+        with pytest.raises(ValueError):
+            quote_value(float("inf"))
+
+    def test_nan_raises(self) -> None:
+        with pytest.raises(ValueError):
+            quote_value(float("nan"))
+
+    def test_neg_inf_raises(self) -> None:
+        with pytest.raises(ValueError):
+            quote_value(float("-inf"))
+
+    def test_unknown_type_raises_type_error(self) -> None:
+        """Unknown types must be rejected, not silently converted via str()."""
+
+        class CustomObj:
+            def __str__(self) -> str:
+                return "injected"
+
+        with pytest.raises(TypeError):
+            quote_value(CustomObj())
+
+    def test_bytes_raises_type_error(self) -> None:
+        """bytes is not a supported SQL literal type."""
+        with pytest.raises(TypeError):
+            quote_value(b"hello")
+
+
+class TestInlineParams:
+    def test_single_param(self) -> None:
+        result = inline_params("col = ?", ("hello",))
+        assert result == "col = 'hello'"
+
+    def test_multiple_params(self) -> None:
+        result = inline_params("a = ? AND b = ?", (1, "x"))
+        assert result == "a = 1 AND b = 'x'"
+
+    def test_none_param(self) -> None:
+        result = inline_params("col IS ?", (None,))
+        assert result == "col IS NULL"
+
+    def test_question_mark_inside_value_not_consumed(self) -> None:
+        """A ? inside a substituted value must not be treated as the next placeholder."""
+        result = inline_params("a = ? AND b = ?", ("a?b", "c"))
+        assert result == "a = 'a?b' AND b = 'c'"
+
+    def test_sql_injection_in_value(self) -> None:
+        result = inline_params("col = ?", ("'; DROP TABLE t; --",))
+        assert result == "col = '''; DROP TABLE t; --'"
+
+    def test_no_params(self) -> None:
+        result = inline_params("col = 1", ())
+        assert result == "col = 1"
+
+    def test_placeholder_count_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="Placeholder count"):
+            inline_params("a = ? AND b = ?", (1,))
+
+
+class TestPickHelperColumnName:
+    def test_pick_helper_column_name_skips_case_variant_taken(self) -> None:
+        """SQL identifiers are case-insensitive: taken={'__MLODA_RN0__'} must skip index 0."""
+        result = pick_helper_column_name(taken={"__MLODA_RN0__"})
+        assert result != "__mloda_rn0__"
+        assert result == "__mloda_rn1__"
+
+    def test_pick_helper_column_name_lowercases_uppercase_prefix(self) -> None:
+        """An uppercase prefix must be ASCII-lowercased before building the candidate name."""
+        result = pick_helper_column_name(taken=set(), prefix="__MLODA_RN")
+        assert result == "__mloda_rn0__"
+
+    def test_pick_helper_column_name_uppercase_prefix_skips_case_variant(self) -> None:
+        """A mixed-case prefix must not collide case-insensitively with taken."""
+        result = pick_helper_column_name(taken={"__mloda_rn0__"}, prefix="__MLODA_RN")
+        assert result == "__mloda_rn1__"
+
+    def test_pick_helper_column_name_folds_ascii_only(self) -> None:
+        result = pick_helper_column_name(taken={"straße0__"}, prefix="STRASSE")
+        assert result == "strasse0__"
+
+
+class TestFoldIdentifier:
+    def test_lowercases_ascii(self) -> None:
+        assert fold_identifier("Val_ABC") == "val_abc"
+
+    def test_leaves_non_ascii_unchanged(self) -> None:
+        assert fold_identifier("É") == "É"
+        assert fold_identifier("straße") == "straße"
+
+
+class TestEnsureDistinctIdentifiers:
+    def test_distinct_passes(self) -> None:
+        ensure_distinct_identifiers(["a", "b", "c"], "join")
+
+    def test_case_only_collision_raises_naming_both_and_operation(self) -> None:
+        with pytest.raises(ValueError, match="rename") as exc:
+            ensure_distinct_identifiers(["id", "Val", "val"], "join")
+        message = str(exc.value)
+        assert "join" in message
+        assert repr("Val") in message
+        assert repr("val") in message
+
+    def test_exact_duplicate_raises(self) -> None:
+        with pytest.raises(ValueError, match="rename"):
+            ensure_distinct_identifiers(["a", "a"], "from_dict")
+
+    def test_non_ascii_case_variants_pass(self) -> None:
+        ensure_distinct_identifiers(["é", "É"], "join")
+
+    def test_custom_fold_makes_non_ascii_case_variants_collide(self) -> None:
+        with pytest.raises(ValueError, match="rename") as exc:
+            ensure_distinct_identifiers(["é", "É"], "join", fold=str.lower)
+        message = str(exc.value)
+        assert "join" in message
+        assert repr("é") in message
+        assert repr("É") in message
+
+
+class TestPickRenamePrefix:
+    def test_free_case_returns_first_prefix(self) -> None:
+        assert pick_rename_prefix("_mloda_r", ["x"], reserved=["a"]) == "_mloda_r0_"
+
+    def test_skips_prefix_whose_renamed_name_is_reserved(self) -> None:
+        assert pick_rename_prefix("_mloda_r", ["x"], reserved=["_MLODA_R0_x"]) == "_mloda_r1_"
+
+    def test_custom_fold_blocks_non_ascii_case_variant(self) -> None:
+        result = pick_rename_prefix("_mloda_r", ["é"], reserved=["_MLODA_R0_É"], fold=str.lower)
+        assert result == "_mloda_r1_"
+
+    def test_default_ascii_fold_ignores_non_ascii_case_variant(self) -> None:
+        assert pick_rename_prefix("_mloda_r", ["é"], reserved=["_MLODA_R0_É"]) == "_mloda_r0_"

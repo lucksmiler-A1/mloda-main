@@ -1,0 +1,117 @@
+import threading
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+import pyarrow as pa
+import pyarrow.flight as flight
+from mloda.core.runtime.flight.flight_server import FlightServer, create_location
+
+
+class TestFlightServerUnit:
+    server: Any = None
+    context: Any = None
+    table: Any = None
+    table_key: Any = None
+    descriptor: Any = None
+    ticket: Any = None
+    location: Any = None
+
+    @classmethod
+    def setup_class(cls) -> None:
+        """Set up test environment and instantiate server"""
+        cls.server = FlightServer()
+        cls.context = MagicMock()
+        cls.table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        cls.table_key = "test_table"
+        cls.descriptor = flight.FlightDescriptor.for_path(cls.table_key)
+        cls.ticket = flight.Ticket(cls.table_key.encode("utf-8"))
+        cls.location = cls.server.location
+
+    @classmethod
+    def teardown_class(cls) -> None:
+        cls.server.shutdown()
+
+    def test_do_put_and_get(self) -> None:
+        """Test storing a table in the server."""
+        reader = MagicMock()
+        reader.read_all.return_value = self.table
+        writer = MagicMock()
+
+        # Execute do_put method
+        self.server.do_put(self.context, self.descriptor, reader, writer)
+
+        assert self.table_key.encode("utf-8") in self.server.tables
+        assert self.server.tables[self.table_key.encode("utf-8")] == self.table
+
+        result_stream = self.server.do_get(self.context, self.ticket)
+        assert isinstance(result_stream, flight.RecordBatchStream)
+
+    def test_do_get_not_found(self) -> None:
+        """Test error handling when table is not found."""
+        # Ensure server has at least one table so we test the KeyError path,
+        # not the ValueError path for empty tables
+        self.server.tables[b"existing_table"] = self.table
+
+        non_existent_ticket = flight.Ticket(b"non_existent_table")
+        with pytest.raises(KeyError, match=r"Table with key b'non_existent_table' not found.*Held keys"):
+            self.server.do_get(self.context, non_existent_ticket)
+
+    def test_do_get_empty_server(self) -> None:
+        """Test error handling when server has no tables."""
+        # Save and clear tables
+        saved_tables = self.server.tables.copy()
+        self.server.tables.clear()
+
+        try:
+            ticket = flight.Ticket(b"some_key")
+            with pytest.raises(ValueError, match=r"Try to get an empty apache flight.*Requested key.*some_key"):
+                self.server.do_get(self.context, ticket)
+        finally:
+            self.server.tables = saved_tables
+
+    def test_create_location_uses_loopback_host_by_default(self) -> None:
+        location = create_location()
+
+        assert location.startswith("grpc://127.0.0.1:")
+
+    def test_create_location_requests_system_assigned_port_by_default(self) -> None:
+        assert create_location() == "grpc://127.0.0.1:0"
+
+    def test_create_location_requests_system_assigned_port_for_custom_host(self) -> None:
+        assert create_location("0.0.0.0") == "grpc://0.0.0.0:0"
+
+
+class TestFlightServerIntegration:
+    server: Any = None
+    table: Any = None
+    table_key: Any = None
+    location: Any = None
+    server_thread: Any = None
+
+    @classmethod
+    def setup_class(cls) -> None:
+        cls.server = FlightServer()
+        cls.server_thread = threading.Thread(target=cls.server.serve)
+        cls.server_thread.start()
+        cls.location = cls.server.location
+
+    @classmethod
+    def teardown_class(cls) -> None:
+        cls.server.shutdown()
+        cls.server_thread.join()
+
+    def test_server_operations(self) -> None:
+        """Test operations involving actual server-client interaction"""
+
+        table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        table_key = "test_table"
+
+        FlightServer.upload_table(self.location, table, table_key)
+        result_table = FlightServer.download_table(self.location, table_key)
+        assert table == result_table
+        assert result_table == table
+
+        FlightServer.drop_tables(self.location, {table_key})
+        with pytest.raises(ValueError):
+            FlightServer.download_table(self.location, table_key)

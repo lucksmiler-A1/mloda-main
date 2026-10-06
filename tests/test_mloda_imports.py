@@ -1,0 +1,333 @@
+"""
+Test file for mloda namespace package and imports.
+
+Structure:
+- `mloda` - PEP 420 namespace package (no __init__.py)
+- `mloda.user` - Full Data User toolkit
+- `mloda.provider` - Data Provider base classes
+- `mloda.steward` - Data Steward governance
+"""
+
+import os
+
+
+# =============================================================================
+# PEP 420 Namespace Package Tests
+# =============================================================================
+
+
+def test_mloda_is_namespace_package() -> None:
+    """Verify mloda is a PEP 420 namespace package (no __init__.py at root)."""
+    import mloda
+
+    # Namespace packages have __path__ but __file__ is None
+    assert hasattr(mloda, "__path__")
+    assert mloda.__file__ is None, f"mloda should be namespace package but has __file__: {mloda.__file__}"
+
+
+def test_mloda_namespace_path_is_iterable() -> None:
+    """Verify mloda.__path__ is iterable (namespace package behavior)."""
+    import mloda
+
+    assert hasattr(mloda, "__path__")
+    paths = list(mloda.__path__)
+    assert len(paths) >= 1, "Namespace package should have at least one path"
+
+    # When running in installed testenv, verify it's from site-packages via __path__
+    if os.environ.get("MLODA_INSTALLED_TEST"):
+        path_str = str(paths)
+        assert "site-packages" in path_str, f"Expected installed package, got: {path_str}"
+
+
+# =============================================================================
+# mloda.user Module Tests (Data User toolkit)
+# =============================================================================
+
+
+def test_import_user_full() -> None:
+    """from mloda.user import ... (Data User toolkit)"""
+    from mloda.user import (
+        # mloda
+        mlodaAPI,
+        mloda,
+        # Features
+        Feature,
+        Features,
+        FeatureName,
+        Options,
+        Domain,
+        # Link & Index
+        Link,
+        JoinType,
+        JoinSpec,
+        Index,
+        # Filtering
+        GlobalFilter,
+        SingleFilter,
+        FilterType,
+        # Data access
+        DataAccessCollection,
+        # Types
+        DataType,
+        ParallelizationMode,
+        # Plugin discovery
+        PluginLoader,
+        PluginCollector,
+        # Resolved execution plan
+        PlanStep,
+    )
+
+    # mloda
+    assert mloda is not None
+    assert mlodaAPI is not None
+    assert hasattr(mlodaAPI, "run_all")
+    assert callable(mloda.run_all)
+    # Features
+    assert Feature is not None
+    assert Features is not None
+    assert FeatureName is not None
+    assert Options is not None
+    assert Domain is not None
+    # Link & Index
+    assert Link is not None
+    assert JoinType is not None
+    assert JoinSpec is not None
+    assert Index is not None
+    # Filtering
+    assert GlobalFilter is not None
+    assert SingleFilter is not None
+    assert FilterType is not None
+    # Data access
+    assert DataAccessCollection is not None
+    # Types
+    assert DataType is not None
+    assert ParallelizationMode is not None
+    # Plugin discovery
+    assert PluginLoader is not None
+    assert PluginCollector is not None
+    # Resolved execution plan
+    assert PlanStep is not None
+    assert callable(mlodaAPI.explain)
+    assert hasattr(mlodaAPI, "resolved_plan")
+
+
+# =============================================================================
+# mloda.provider Module Tests (Data Provider base classes)
+# =============================================================================
+
+
+def test_import_provider_base_classes() -> None:
+    """from mloda.provider import ... (Data Provider base classes)"""
+    import mloda.provider as provider_module
+    from mloda.provider import (
+        # Base classes
+        FeatureGroup,
+        ComputeFramework,
+        # Versioning
+        BaseFeatureGroupVersion,
+        ThirdPartyVersionMode,
+        # Feature set
+        FeatureSet,
+        # Input data
+        BaseInputData,
+        ApiInputData,
+        ApiInputDataFeature,
+        BaseApiData,
+        ApiInputDataCollection,
+        DataCreator,
+        # Match data
+        MatchData,
+        # Artifact
+        BaseArtifact,
+        # Validators
+        BaseValidator,
+        FeatureValidator,
+        FeatureSetValidator,
+        OptionsValidator,
+        LinkValidator,
+        DataTypeValidator,
+        DataTypeMismatchError,
+        # Feature chaining
+        FeatureChainParser,
+        FeatureChainParserMixin,
+        # Column-wise hook contract
+        COLUMNWISE_HOOKS,
+        COLUMN_DISCOVERY_HOOKS,
+        missing_columnwise_hooks,
+        declared_columnwise_hooks,
+        # Match rejection recording
+        record_match_rejection,
+        INPUT_DATA_STAGE,
+        NAME_STAGE,
+        # Transformers
+        BaseTransformer,
+        ComputeFrameworkTransformer,
+        # Optional-dependency import guards
+        traceback_blames_root,
+        # Engines
+        BaseFilterEngine,
+        BaseMergeEngine,
+        # Credential scrubbing
+        scrub_credentials,
+    )
+
+    # Base classes
+    assert FeatureGroup is not None
+    assert ComputeFramework is not None
+    # Versioning
+    assert BaseFeatureGroupVersion is not None
+    assert ThirdPartyVersionMode is not None
+    # Feature set
+    assert FeatureSet is not None
+    # Input data
+    assert BaseInputData is not None
+    assert ApiInputData is not None
+    assert ApiInputDataFeature is not None
+    assert BaseApiData is not None
+    assert ApiInputDataCollection is not None
+    assert DataCreator is not None
+    # Match data
+    assert MatchData is not None
+    # Artifact
+    assert BaseArtifact is not None
+    # Validators
+    assert BaseValidator is not None
+    assert FeatureValidator is not None
+    assert FeatureSetValidator is not None
+    assert OptionsValidator is not None
+    assert LinkValidator is not None
+    assert DataTypeValidator is not None
+    assert DataTypeMismatchError is not None
+    # Feature chaining
+    assert FeatureChainParser is not None
+    assert FeatureChainParserMixin is not None
+    # Column-wise hook contract: a plugin author declares it without reading core source
+    assert COLUMNWISE_HOOKS
+    assert COLUMN_DISCOVERY_HOOKS > COLUMNWISE_HOOKS
+    assert callable(missing_columnwise_hooks)
+    assert callable(declared_columnwise_hooks)
+    # Match rejection recording
+    assert callable(record_match_rejection)
+    assert INPUT_DATA_STAGE == "input_data"
+    assert NAME_STAGE == "name"
+    # Transformers
+    assert BaseTransformer is not None
+    assert ComputeFrameworkTransformer is not None
+    # Optional-dependency import guards
+    assert callable(traceback_blames_root)
+    assert "traceback_blames_root" in provider_module.__all__
+    # Engines
+    assert BaseFilterEngine is not None
+    assert BaseMergeEngine is not None
+    # Credential scrubbing
+    assert callable(scrub_credentials)
+    assert "scrub_credentials" in provider_module.__all__
+
+
+# =============================================================================
+# mloda.steward Module Tests (Data Steward governance)
+# =============================================================================
+
+
+def test_import_steward_governance() -> None:
+    """from mloda.steward import ... (Data Steward governance)"""
+    import mloda.steward as steward_module
+    from mloda.steward import (
+        # Plugin inspection
+        FeatureGroupInfo,
+        ComputeFrameworkInfo,
+        ExtenderInfo,
+        # Documentation
+        get_feature_group_docs,
+        get_compute_framework_docs,
+        get_extender_docs,
+        # Function extenders (audit, monitoring, observability)
+        Extender,
+        ExtenderHook,
+        CloseContext,
+        # Optional-dependency import guards
+        traceback_blames_root,
+        # Pickle safety
+        pickle_failure_reason,
+        is_picklable,
+        WarnOncePerInstance,
+        # Resolved execution plan
+        PlanStep,
+        # Credential scrubbing
+        scrub_credentials,
+        # Plan/run lifecycle
+        LifecycleOutcome,
+        PlanContext,
+        RunContext,
+        AsOfJoinConfig,
+    )
+
+    # Plugin inspection
+    assert FeatureGroupInfo is not None
+    assert ComputeFrameworkInfo is not None
+    assert ExtenderInfo is not None
+    # Resolved execution plan
+    assert PlanStep is not None
+    # Documentation
+    assert get_feature_group_docs is not None
+    assert get_compute_framework_docs is not None
+    assert get_extender_docs is not None
+    # Function extenders
+    assert Extender is not None
+    assert ExtenderHook is not None
+    assert CloseContext is not None
+    assert "CloseContext" in steward_module.__all__
+    assert "GateBypassError" in steward_module.__all__
+    from mloda.steward import GateBypassError
+
+    assert issubclass(GateBypassError, RuntimeError)
+    # Optional-dependency import guards
+    assert callable(traceback_blames_root)
+    assert "traceback_blames_root" in steward_module.__all__
+    # Pickle safety
+    assert callable(pickle_failure_reason)
+    assert callable(is_picklable)
+    assert WarnOncePerInstance is not None
+    assert "pickle_failure_reason" in steward_module.__all__
+    assert "is_picklable" in steward_module.__all__
+    assert "WarnOncePerInstance" in steward_module.__all__
+    # Credential scrubbing
+    assert callable(scrub_credentials)
+    assert "scrub_credentials" in steward_module.__all__
+    # Plan/run lifecycle
+    for lifecycle_name, lifecycle_type in (
+        ("LifecycleOutcome", LifecycleOutcome),
+        ("PlanContext", PlanContext),
+        ("RunContext", RunContext),
+    ):
+        assert lifecycle_type is not None
+        assert lifecycle_name in steward_module.__all__
+    # JOIN hook as-of configuration
+    from mloda.core.abstract_plugins.components.link import AsOfJoinConfig as CoreAsOfJoinConfig
+
+    assert AsOfJoinConfig is CoreAsOfJoinConfig
+    assert "AsOfJoinConfig" in steward_module.__all__
+
+
+# =============================================================================
+# Cross-Module Integration Tests
+# =============================================================================
+
+
+def test_all_roles_demo() -> None:
+    """Demo: Three roles with explicit modules"""
+    # Data User
+    from mloda.user import mloda, Feature, Options
+
+    # Data Provider
+    from mloda.provider import FeatureGroup, BaseFeatureGroupVersion
+
+    # Data Steward
+    from mloda.steward import get_feature_group_docs
+
+    assert mloda is not None
+    assert Feature is not None
+    assert Options is not None
+    assert FeatureGroup is not None
+    assert BaseFeatureGroupVersion is not None
+    assert get_feature_group_docs is not None

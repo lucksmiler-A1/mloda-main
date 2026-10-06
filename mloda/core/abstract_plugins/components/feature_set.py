@@ -1,0 +1,235 @@
+from collections import Counter
+from typing import TYPE_CHECKING, Any, Iterable
+from uuid import UUID
+
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.components.validators.feature_set_validator import FeatureSetValidator
+from mloda.core.abstract_plugins.input_data_load_marker import InputDataLoadMarker, current_input_data_load_marker
+from mloda.core.filter.filter_engine import BaseFilterEngine
+from mloda.core.abstract_plugins.components.mask.base_mask_engine import BaseMaskEngine
+from mloda.core.filter.single_filter import SingleFilter
+
+if TYPE_CHECKING:
+    from mloda.core.abstract_plugins.components.input_data.base_input_data import BaseInputData
+    from mloda.core.abstract_plugins.feature_group import FeatureGroup
+
+
+def merge_input_feature_edges(pairs: Iterable[tuple[str, Iterable[str]]]) -> dict[str, tuple[str, ...]] | None:
+    """Fold (feature name, declared input names) pairs into output name -> sorted inputs; None when empty."""
+    merged: dict[str, set[str]] = {}
+    for name, inputs in pairs:
+        declared = {str(entry) for entry in inputs}
+        if declared:
+            merged.setdefault(str(name), set()).update(declared)
+    return {name: tuple(sorted(inputs)) for name, inputs in sorted(merged.items())} or None
+
+
+def option_split_paragraph(hint: tuple[str, frozenset[Any]] | None) -> str:
+    """Error-message paragraph naming the root whose option split likely caused a missing-Link failure."""
+    if hint is None:
+        return ""
+    split_feature_group_name, differing_keys = hint
+    differing_keys_str = ", ".join(sorted((str(k) for k in differing_keys), key=str))
+    return f"""
+'{split_feature_group_name}' also ran as a separate step with differing option(s) ({differing_keys_str})
+in this run, which is the likely cause. Align the differing option(s) across the requests, or add
+a Link if the split is intentional.
+"""
+
+
+class FeatureSet:
+    def __init__(self, features: Iterable[Feature] | None = None) -> None:
+        self.features: set[Feature] = set()
+        self.options: Options | None = None
+        # This is just one uuid for easier access
+        self.any_uuid: UUID | None = None
+        self.step_uuid: UUID | None = None
+        self.filters: set[SingleFilter] | None = None
+        self.name_of_one_feature: FeatureName | None = None
+        self.artifact_to_save: str | None = None
+        self.artifact_to_load: str | None = None
+        self.save_artifact: Any | None = None
+        self.filter_engine: type[BaseFilterEngine] = BaseFilterEngine
+        self.mask_engine: type[BaseMaskEngine] | None = None
+        self.declared_input_feature_names: frozenset[str] | None = None
+        self.declared_input_features_resolved: bool = False
+        self.declared_input_feature_edges: dict[str, tuple[str, ...]] | None = None
+        self.specialized_from: tuple[str, ...] = ()
+        self.option_split_hint: tuple[str, frozenset[Any]] | None = None
+        # Columns a Link reads from this step's data, stamped by the planner.
+        self.link_index_columns: frozenset[str] = frozenset()
+        self._load_marker: InputDataLoadMarker | None = current_input_data_load_marker.get()
+
+        if features is not None:
+            for feature in features:
+                self.add(feature)
+
+    def add_artifact_name(self) -> None:
+        FeatureSetValidator.validate_options_initialized(self.options, "add_artifact_name")
+        assert self.options is not None  # Type narrowing for mypy
+
+        for feature_name in self.get_all_names():
+            if feature_name in self.options.keys():
+                self.artifact_to_load = feature_name
+                return
+
+        self.artifact_to_save = self.get_name_of_one_feature()
+
+    def resolve_artifact_for_runtime(self, runtime_artifacts: dict[str, Any]) -> None:
+        """Re-resolve artifact save/load mode using runtime artifacts from run().
+
+        Called at step execution time on the deep-copied FeatureSet when
+        artifacts are passed to run(). This enables switching between save
+        and load modes across run() calls without re-preparing.
+        """
+        FeatureSetValidator.validate_options_initialized(self.options, "resolve_artifact_for_runtime")
+        assert self.options is not None
+
+        for feature_name in self.get_all_names():
+            if feature_name in runtime_artifacts:
+                # Dedupe by identity, not equality: Options.__eq__/__hash__ is group-content-based,
+                # so distinct instances with equal groups must not collapse into one.
+                distinct_options = {id(feature.options): feature.options for feature in self.features}.values()
+
+                for options in distinct_options:
+                    if feature_name in options.group:
+                        raise ValueError(
+                            f"Artifact '{feature_name}' is already stored in Options.group from a previous "
+                            "save; supply it either via Options at prepare time or via run(artifacts=...), "
+                            f"not both (feature set anchored on '{self.get_name_of_one_feature()}')."
+                        )
+
+                # Write to context (never group, to avoid mutating any Feature's hash) on every
+                # distinct Options instance, since get_singular_option_from_options may read any of them.
+                # A raw dict write, not add_to_context(): its value-equality check crashes on
+                # non-boolean-comparable artifacts (e.g. numpy arrays) and would block re-resolving
+                # a different artifact across repeated run() calls.
+                for options in distinct_options:
+                    options.context[feature_name] = runtime_artifacts[feature_name]
+
+                self.artifact_to_load = feature_name
+                self.artifact_to_save = None
+                return
+
+        self.artifact_to_load = None
+        self.artifact_to_save = self.get_name_of_one_feature()
+
+    @property
+    def input_data_match(self) -> "tuple[type[BaseInputData], Any] | None":
+        return next((f.input_data_match for f in self.features if f.input_data_match is not None), None)
+
+    def add(self, feature: Feature) -> None:
+        self.features.add(feature)
+        if self.name_of_one_feature is None or feature.name < self.name_of_one_feature:
+            self.name_of_one_feature = feature.name
+        if self.options is None:
+            self.options = feature.options
+        if self.any_uuid is None:
+            self.any_uuid = feature.uuid
+
+    def remove(self, feature: Feature) -> None:
+        self.features.discard(feature)
+
+    def materialize_option_defaults(self, feature_group: "type[FeatureGroup]") -> None:
+        """Rebind every feature's options (and self.options) through feature_group.options_with_defaults,
+        memoized by Options identity so aliases stay aliased; identity no-op without concrete defaults (#796).
+        Precondition: same-named features distinguished only by an explicitly-set default value collapse
+        when the default fills their twin, and that raises. The engine canonicalizes default-equivalent
+        twins at intake, so the raise is a defensive invariant for direct API use."""
+        # The memo holds a strong reference to each source Options so its id cannot be recycled mid-loop.
+        memo: dict[int, tuple[Options, Options]] = {}
+        rebound = False
+        for feature in self.features:
+            source = feature.options
+            entry = memo.get(id(source))
+            if entry is None:
+                entry = (source, feature_group.options_with_defaults(source))
+                memo[id(source)] = entry
+            if entry[1] is not source:
+                feature.options = entry[1]
+                rebound = True
+        if rebound:
+            # Only GROUP fills change Feature hashes (Options.__hash__ is group-only); a comprehension rehashes,
+            # set(self.features) would reuse stale stored hashes. The rebuild also surfaces twin collapses loudly.
+            rebuilt = {feature for feature in self.features}
+            if len(rebuilt) < len(self.features):
+                names = sorted(
+                    name for name, count in Counter(str(feature.name) for feature in self.features).items() if count > 1
+                )
+                raise ValueError(
+                    "Materializing declared defaults collapsed duplicate features (same name, previously "
+                    "distinguished only by an explicitly-set default value now filled on its twin). "
+                    f"Deduplicate the request or set the key explicitly on all twins. Affected: {names}"
+                )
+            self.features = rebuilt
+        options_before = self.options
+        if self.options is not None:
+            entry_for_options = memo.get(id(self.options))
+            if entry_for_options is not None:
+                self.options = entry_for_options[1]
+            else:
+                self.options = feature_group.options_with_defaults(self.options)
+
+        # Materialized options can change what input_features declares, so drop the memo when anything changed.
+        if rebound or self.options is not options_before:
+            self.declared_input_features_resolved = False
+            self.declared_input_feature_names = None
+            self.declared_input_feature_edges = None
+
+    def get_all_feature_ids(self) -> set[UUID]:
+        return {feature.uuid for feature in self.features}
+
+    def get_all_names(self) -> tuple[str, ...]:
+        """Return the unique feature names as an alphabetically sorted tuple (deterministic order)."""
+        return tuple(sorted({feature.name for feature in self.features}))
+
+    def get_sorted_features(self) -> tuple[Feature, ...]:
+        """Return all features sorted by name: deterministic iteration order for callers
+        that materialize column or query order."""
+        return tuple(sorted(self.features, key=lambda feature: feature.name))
+
+    def __str__(self) -> str:
+        return f"{self.features}"
+
+    def get_options_key(self, key: str) -> Any:
+        """
+        Get a value from the shared options across all features in this FeatureSet.
+
+        This method validates that all features in the set have identical options before
+        returning the requested value. If features have different options, it raises ValueError.
+
+        Args:
+            key: The option key to retrieve
+
+        Returns:
+            The value associated with the key, or None if not found
+
+        Raises:
+            ValueError: If options are not initialized or if features have different options
+
+        Note:
+            Prefer accessing options directly from individual features when possible.
+            Only use this when you need to ensure all features share the same option value.
+        """
+        FeatureSetValidator.validate_options_initialized(self.options, "get_options_key")
+        assert self.options is not None  # Type narrowing for mypy
+        FeatureSetValidator.validate_equal_options(self.features)
+        return self.options.get(key)
+
+    def get_initial_requested_features(self) -> tuple[FeatureName, ...]:
+        return tuple(sorted({feature.name for feature in self.features if feature.initial_requested_data}))
+
+    def get_name_of_one_feature(self) -> FeatureName:
+        """Return the alphabetically smallest feature name added to the set (deterministic regardless of add() order)."""
+        FeatureSetValidator.validate_feature_added(self.name_of_one_feature, "get_name_of_one_feature")
+        assert self.name_of_one_feature is not None  # Type narrowing for mypy
+        return self.name_of_one_feature
+
+    def add_filters(self, single_filters: set[SingleFilter]) -> None:
+        FeatureSetValidator.validate_filters_not_set(self.filters)
+        FeatureSetValidator.validate_filters_is_set_type(single_filters)
+        # Copied here, at the storing end: callers hand over the live GlobalFilter.collection set,
+        # which keeps growing across sessions and would retroactively change this plan (#910).
+        self.filters = set(single_filters)

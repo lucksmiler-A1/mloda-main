@@ -1,0 +1,213 @@
+"""
+Base implementation for text cleaning feature groups.
+"""
+
+from __future__ import annotations
+
+from abc import abstractmethod
+from typing import Any
+
+from mloda.provider import FeatureGroup
+from mloda.user import Feature
+from mloda.provider import (
+    FeatureChainParserMixin,
+)
+from mloda.provider import COLUMNWISE_HOOKS
+from mloda.provider import FeatureSet
+from mloda.provider import DefaultOptionKeys
+from mloda.provider import PropertySpec
+
+
+class TextCleaningFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+    """
+    Base class for all text cleaning feature groups.
+
+    Text cleaning feature groups provide operations for preprocessing and cleaning text data.
+    They allow you to apply multiple cleaning operations in sequence to prepare text for
+    further analysis or machine learning tasks.
+
+    ## Feature Naming Convention
+
+    Text cleaning features follow this naming pattern:
+    `{in_features}__cleaned_text`
+
+    The source feature comes first, followed by the cleaning operation.
+    Note the double underscore separating the source feature from the operation.
+
+    Examples:
+    - `review__cleaned_text`: Apply text cleaning operations to the "review" feature
+    - `description__cleaned_text`: Apply text cleaning operations to the "description" feature
+
+    ## Configuration-Based Creation
+
+    TextCleaningFeatureGroup supports configuration-based. This allows features to be created
+    from options rather than explicit feature names.
+
+    To create a text cleaning feature using configuration:
+
+    ```python
+    feature = Feature(
+        "PlaceHolder",  # Placeholder name, will be replaced
+        Options({
+            TextCleaningFeatureGroup.CLEANING_OPERATIONS: ("normalize", "remove_stopwords", "remove_punctuation"),
+            DefaultOptionKeys.in_features: "review"
+        })
+    )
+
+    # The Engine will automatically parse this into a feature with name "review__cleaned_text"
+    ```
+
+    ## Supported Cleaning Operations
+
+    - `normalize`: Convert text to lowercase and remove accents
+    - `remove_stopwords`: Remove common stopwords
+    - `remove_punctuation`: Remove punctuation marks
+    - `remove_special_chars`: Remove special characters
+    - `normalize_whitespace`: Normalize whitespace
+    - `remove_urls`: Remove URLs and email addresses
+
+    ## Requirements
+    - The input data must contain the source feature to be used for text cleaning
+    - The source feature must contain text data
+    """
+
+    # Option key for the list of operations
+    CLEANING_OPERATIONS = "cleaning_operations"
+
+    # Define supported cleaning operations with their descriptions
+    SUPPORTED_OPERATIONS = {
+        "normalize": "Convert text to lowercase and remove accents",
+        "remove_stopwords": "Remove common stopwords",
+        "remove_punctuation": "Remove punctuation marks",
+        "remove_special_chars": "Remove special characters",
+        "normalize_whitespace": "Normalize whitespace",
+        "remove_urls": "Remove URLs and email addresses",
+    }
+
+    # Define prefix pattern
+    PREFIX_PATTERN = r".*__cleaned_text$"
+
+    # The cleaning operations come from options, so the pattern is recognition-only and binds
+    # nothing from the name (#772).
+    RECOGNITION_ONLY_PATTERN = True
+
+    # In-feature configuration for FeatureChainParserMixin
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
+
+    # Property mapping for configuration-based features
+    PROPERTY_MAPPING = {
+        CLEANING_OPERATIONS: PropertySpec(
+            "Sequence of text cleaning operations to apply",
+            allowed_values=SUPPORTED_OPERATIONS,
+            context=True,
+            strict_validation=True,
+            # The option is a sequence of operations; core unpacks it, so this judges ONE operation.
+            element_validator=lambda op: op in TextCleaningFeatureGroup.SUPPORTED_OPERATIONS,
+        ),
+        DefaultOptionKeys.in_features: PropertySpec(
+            "Source feature to apply text cleaning operations to",
+            context=True,
+            strict_validation=False,
+        ),
+    }
+
+    @classmethod
+    def _extract_operations_and_source_feature(cls, feature: Feature) -> tuple[tuple[Any, Any], str]:
+        """
+        Extract cleaning operations and source feature name from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract parameters from
+
+        Returns:
+            Tuple of (operations_tuple, source_feature_name)
+
+        Raises:
+            ValueError: If parameters cannot be extracted
+        """
+        return cls._extract_operation_and_source_feature(feature, cls._extract_cleaning_operations, "operations")
+
+    @classmethod
+    def _extract_cleaning_operations(cls, feature: Feature) -> tuple[Any, Any] | None:
+        """Cleaning operations from feature options (both paths), or None when absent."""
+        operations = feature.options.get(cls.CLEANING_OPERATIONS)
+        return operations if operations is not None else None
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        """
+        Perform text cleaning operations.
+
+        Processes all requested features, applying the specified cleaning operations
+        to the source features.
+
+        Args:
+            data: The input data
+            features: The feature set containing the features to process
+
+        Returns:
+            The data with the cleaned text features added
+        """
+
+        # Process each requested feature
+        for feature in features.get_sorted_features():
+            operations, source_feature = cls._extract_operations_and_source_feature(feature)
+
+            # Check if source feature exists
+            cls._check_source_features_exist(data, [source_feature])
+
+            # Validate operations
+            for operation in operations:
+                if operation not in cls.SUPPORTED_OPERATIONS:
+                    raise ValueError(
+                        f"Unsupported cleaning operation: {operation}. "
+                        f"Supported operations: {', '.join(cls.SUPPORTED_OPERATIONS.keys())}"
+                    )
+
+            # Apply operations in sequence
+            result = cls._get_source_text(data, source_feature)
+
+            for operation in operations:
+                result = cls._apply_operation(data, result, operation)
+
+            # Add result to data
+            data = cls._add_result_to_data(data, feature.name, result)
+
+        return data
+
+    @classmethod
+    @abstractmethod
+    def _get_source_text(cls, data: Any, feature_name: str) -> Any:
+        """
+        Get the source text from the data.
+
+        Args:
+            data: The input data
+            feature_name: The name of the feature to get
+
+        Returns:
+            The source text
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def _apply_operation(cls, data: Any, text: Any, operation: str) -> Any:
+        """
+        Apply a cleaning operation to the text.
+
+        Args:
+            data: The input data (for context)
+            text: The text to clean
+            operation: The operation to apply
+
+        Returns:
+            The cleaned text
+        """
+        ...

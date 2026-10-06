@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+import tempfile
+from typing import Any
+
+from mloda.user import PluginCollector
+from mloda_plugins.feature_group.input_data.read_db_feature import ReadDBFeature
+from mloda_plugins.feature_group.input_data.read_dbs.sqlite import SQLITEReader
+from mloda_plugins.feature_group.input_data.read_file_feature import ReadFileFeature
+from mloda_plugins.feature_group.input_data.read_files.csv import CsvReader
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from mloda.provider import FeatureGroup
+from mloda.user import DataAccessCollection
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.provider import FeatureSet
+from mloda.user import Index
+from mloda.user import Link, JoinSpec
+from mloda.user import Options
+from mloda.core.abstract_plugins.components.index.add_index_feature import create_index_feature
+from mloda.user import mloda
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable  # noqa: F401
+from tests.test_plugins.feature_group.input_data.test_classes.test_input_classes import (
+    DBInputDataTestFeatureGroup,
+)
+
+
+class TestAddIndex:
+    file_path = f"{os.getcwd()}/tests/test_plugins/feature_group/src/dataset/creditcard_2023_short.csv"
+
+    feature_names = "id,V1,V2,V3,V4,V5,V6,V7,V8,V9,V10,V11,V12,V13,V14,V15,V16,V17,V18,V19,V20,V21,V22,V23,V24,V25,V26,V27,V28,Amount,Class"
+    feature_list = feature_names.split(",")
+
+    def setup_method(self) -> None:
+        # Create a temporary file to act as the SQLite database
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".sqlite")
+        # Initialize the SQLite database with a sample table
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, name TEXT, any_num INTEGER)")
+        self.cursor.execute('INSERT INTO test_table (name, any_num) VALUES ("Alice", 3)')
+        self.cursor.execute('INSERT INTO test_table (name, any_num) VALUES ("Bob", 4)')
+        self.conn.commit()
+
+    def teardown_method(self) -> None:
+        self.conn.close()
+        os.close(self.db_fd)
+        os.remove(self.db_path)
+
+    def test_add_index_simple(
+        self,
+    ) -> None:
+        class ReadFileFeatureWithIndex(ReadFileFeature):
+            @classmethod
+            def index_columns(cls) -> list[Index] | None:
+                return [Index(("id",))]
+
+            @classmethod
+            def match_feature_group_criteria(
+                cls,
+                feature_name: FeatureName | str,
+                options: Options,
+                data_access_collection: DataAccessCollection | None = None,
+            ) -> bool:
+                # Feature is only valid for this test
+                if options.get("test_add_index_simple") is None:
+                    return False
+
+                if isinstance(feature_name, FeatureName):
+                    feature_name = str(feature_name)
+
+                if cls().is_root(options, feature_name):
+                    input_data_class = cls.input_data()
+                    return input_data_class.matches(feature_name, options, data_access_collection)  # type: ignore
+                return False
+
+        class DBInputDataTestFeatureGroupWithIndex(DBInputDataTestFeatureGroup):
+            @classmethod
+            def index_columns(cls) -> list[Index] | None:
+                return [Index(("id",))]
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                reader = cls.input_data()
+                if reader is not None:
+                    result = reader.load(features)
+
+                    # As of date of writing this test, we did not handle the types automatically.
+                    # Thus, we need to convert the columns to int64...
+                    for column_name in features.get_all_names():
+                        index = result.schema.get_field_index(column_name)
+                        int64_column = result[column_name].cast(pa.int64())
+                        result = result.set_column(index, column_name, int64_column)
+
+                    return result
+
+                raise ValueError(f"Reading file failed for feature {features.get_name_of_one_feature()}.")
+
+        class AddIndexTest(FeatureGroup):
+            @classmethod
+            def match_feature_group_criteria(
+                cls,
+                feature_name: FeatureName | str,
+                options: Options,
+                data_access_collection: DataAccessCollection | None = None,
+            ) -> bool:
+                if "TestAddIndexFeature" in str(feature_name):
+                    return True
+                return False
+
+            def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+                return {Feature.int32_of("Amount"), Feature.int32_of("any_num")}
+
+            @classmethod
+            def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+                return data.append_column(
+                    "TestAddIndexFeature",
+                    pc.add(data["Amount"], data["any_num"]),  # Perform addition using pyarrow.compute
+                )
+
+        link = Link(
+            jointype="inner",
+            left=JoinSpec(ReadFileFeatureWithIndex, Index(("id",))),
+            right=JoinSpec(DBInputDataTestFeatureGroupWithIndex, Index(("id",))),
+        )
+        f = Feature(
+            name="TestAddIndexFeature",
+            options={
+                CsvReader.__name__: self.file_path,
+                SQLITEReader.__name__: {SQLITEReader.db_path(): self.db_path, "table_name": "test_table"},
+                "test_add_index_simple": True,
+            },
+        )
+
+        result = mloda.run_all(
+            [f],
+            compute_frameworks=["PyArrowTable"],
+            links={link},
+            plugin_collector=PluginCollector.disabled_feature_groups({ReadDBFeature}),
+        )
+        res = result[0].to_pydict()
+        assert res == {"TestAddIndexFeature": [6534.37, 2517.54]}
+
+
+def test_create_index_feature_copies_input_data_match() -> None:
+    source = Feature("add_index_match_col", compute_framework="PyArrowTable")
+    source.input_data_match = (CsvReader, "add_index_match_access")
+
+    index_feature = create_index_feature(Index(("id",)), FeatureGroup(), source)
+
+    assert index_feature.input_data_match == (CsvReader, "add_index_match_access")
+
+
+def test_create_index_feature_copies_framework_pin() -> None:
+    source = Feature("add_index_pin_col", compute_framework="PyArrowTable")
+    source.framework_pinned = True
+
+    index_feature = create_index_feature(Index(("id",)), FeatureGroup(), source)
+
+    assert index_feature.framework_pinned is True

@@ -1,0 +1,1030 @@
+"""Tests for FeatureChainParserMixin."""
+
+import logging
+from typing import Any
+
+import pytest
+
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.user import Options
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import (
+    FeatureChainParserMixin,
+)
+from mloda.core.abstract_plugins.components.utils import escalate_match_abort
+from mloda.provider import DefaultOptionKeys, PropertySpec, property_spec
+
+
+MIXIN_LOGGER_NAME = "mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin"
+
+ABORT_MESSAGE = "abort_in_features_escalated"
+
+
+class MockFeatureGroup(FeatureChainParserMixin):
+    """Mock Feature group for testing the mixin with default settings."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1", "op2": "Operation 2"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+
+class MockFeatureGroupCustomSeparator(FeatureChainParserMixin):
+    """Mock Feature group with custom in_feature separator."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    IN_FEATURE_SEPARATOR = ","
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1", "op2": "Operation 2"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+
+class MockFeatureGroupWithMinMax(FeatureChainParserMixin):
+    """Mock Feature group with min/max in_feature constraints."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    MIN_IN_FEATURES = 2
+    MAX_IN_FEATURES = 3
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+
+class MockFeatureGroupSingleInFeature(FeatureChainParserMixin):
+    """Mock Feature group that accepts exactly one in_feature."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+
+class _HiddenAttribute:
+    """Descriptor that makes hasattr return False by raising AttributeError."""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    def __get__(self, obj: object, objtype: type | None = None) -> None:
+        raise AttributeError(self.name)
+
+
+class MockFeatureGroupWithoutMinMax(FeatureChainParserMixin):
+    """Mock Feature group without MIN/MAX_IN_FEATURES to test hasattr guard."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    MIN_IN_FEATURES = _HiddenAttribute()  # type: ignore[assignment]
+    MAX_IN_FEATURES = _HiddenAttribute()
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+
+class MockFeatureGroupWithValidationHook(FeatureChainParserMixin):
+    """Mock Feature group that implements _validate_string_match hook."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+    @classmethod
+    def _validate_string_match(cls, feature_name: str, operation_config: str, source_feature: str) -> bool:
+        """Hook to validate string-based matches - reject operation 'reject_me'."""
+        return operation_config != "reject_me"
+
+
+class MockFeatureGroupSingleInFeatureCustomReason(FeatureChainParserMixin):
+    """Mock single-source Feature group overriding in_feature_count_reason with custom wording."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+    @classmethod
+    def in_feature_count_reason(cls, feature_name: str | FeatureName, count: int) -> str | None:
+        """Custom arity wording that must win over the mixin's generic MIN/MAX message."""
+        if count != 1:
+            return f"{cls.__name__} needs exactly one input column; got {count}."
+        return None
+
+
+class MockFeatureGroupZeroSources(FeatureChainParserMixin):
+    """Mock Feature group whose _extract_source_features always resolves to zero sources."""
+
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+    @classmethod
+    def _extract_source_features(cls, feature: Feature) -> list[str]:
+        return []
+
+
+class MockFeatureGroupNoMaxDeclared(FeatureChainParserMixin):
+    """Mock Feature group leaving MIN/MAX_IN_FEATURES at their class defaults (1 / unbounded)."""
+
+    PREFIX_PATTERN = r".*__([\w]+)_test$"
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+
+class MockFeatureGroupMinZero(FeatureChainParserMixin):
+    """Mock Feature group with MIN_IN_FEATURES=0, whose _extract_source_features always resolves to zero sources."""
+
+    MIN_IN_FEATURES = 0
+    PROPERTY_MAPPING = {
+        "operation": PropertySpec(
+            "Operation to apply",
+            allowed_values={"op1": "Operation 1"},
+            context=True,
+            strict_validation=True,
+        )
+    }
+
+    @classmethod
+    def _extract_source_features(cls, feature: Feature) -> list[str]:
+        return []
+
+
+class TestFeatureChainParserMixinInputFeatures:
+    """Tests for input_features() method."""
+
+    def test_input_features_string_based_single_source(self) -> None:
+        """Test that string-based parsing extracts single source feature."""
+        feature_name = FeatureName("source_feature__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroup()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 1
+        assert Feature("source_feature") in result
+
+    def test_input_features_string_based_multiple_sources(self) -> None:
+        """Test parsing feature name with ampersand separator for multiple sources."""
+        feature_name = FeatureName("point1&point2__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroup()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 2
+        assert Feature("point1") in result
+        assert Feature("point2") in result
+
+    def test_input_features_string_based_three_sources(self) -> None:
+        """Test parsing feature name with three sources using ampersand separator."""
+        feature_name = FeatureName("feat1&feat2&feat3__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroup()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 3
+        assert Feature("feat1") in result
+        assert Feature("feat2") in result
+        assert Feature("feat3") in result
+
+    def test_input_features_config_based_fallback(self) -> None:
+        """Test that when string parsing fails, fall back to options.get_in_features()."""
+        feature_name = FeatureName("simple_name")
+        options = Options(
+            context={
+                DefaultOptionKeys.in_features: ["feature_a", "feature_b"],
+                "operation": "op1",
+            }
+        )
+
+        mock_fg = MockFeatureGroup()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 2
+        assert Feature("feature_a") in result
+        assert Feature("feature_b") in result
+
+    def test_input_features_min_constraint_violated(self) -> None:
+        """Test that ValueError is raised when fewer than min_source_features."""
+        feature_name = FeatureName("single_feature__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroupWithMinMax()
+
+        with pytest.raises(ValueError) as exc_info:
+            mock_fg.input_features(options, feature_name)
+
+        assert "minimum" in str(exc_info.value).lower() or "at least" in str(exc_info.value).lower()
+
+    def test_input_features_max_constraint_violated(self) -> None:
+        """Test that ValueError is raised when more than max_source_features."""
+        feature_name = FeatureName("f1&f2&f3&f4__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroupWithMinMax()
+
+        with pytest.raises(ValueError) as exc_info:
+            mock_fg.input_features(options, feature_name)
+
+        assert "maximum" in str(exc_info.value).lower() or "at most" in str(exc_info.value).lower()
+
+    def test_input_features_within_min_max_constraints(self) -> None:
+        """Test that parsing succeeds when source features are within min/max bounds."""
+        feature_name = FeatureName("f1&f2__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroupWithMinMax()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 2
+
+
+class TestFeatureChainParserMixinMatchFeatureGroupCriteria:
+    """Tests for match_feature_group_criteria() classmethod."""
+
+    def test_match_feature_group_criteria_pattern_match(self) -> None:
+        """Test that pattern-based matching returns True for valid feature names."""
+        feature_name = FeatureName("source_feature__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        result = MockFeatureGroup.match_feature_group_criteria(feature_name, options)
+
+        assert result is True
+
+    def test_match_feature_group_criteria_no_pattern_match_but_valid_config(self) -> None:
+        """Test that config-based matching works even if pattern doesn't match.
+
+        This matches the behavior of match_configuration_feature_chain_parser()
+        which returns True for valid config even if pattern doesn't match.
+        """
+        feature_name = FeatureName("source_feature__invalid_suffix")
+        options = Options(context={"operation": "op1", "in_features": "source_feature"})
+
+        result = MockFeatureGroup.match_feature_group_criteria(feature_name, options)
+
+        # Config-based matching succeeds because operation is valid
+        assert result is True
+
+    def test_match_feature_group_criteria_config_based(self) -> None:
+        """Test that config-based matching works when pattern doesn't match."""
+        feature_name = FeatureName("any_name_without_pattern")
+        options = Options(context={"operation": "op1", "in_features": "source_feature"})
+
+        result = MockFeatureGroup.match_feature_group_criteria(feature_name, options)
+
+        assert result is True
+
+    def test_match_feature_group_criteria_config_based_invalid_operation(self) -> None:
+        """Test that config-based matching returns False with invalid operation value.
+
+        When strict_validation is True in PROPERTY_MAPPING, invalid values return False
+        instead of raising ValueError, enabling polymorphic feature group identification.
+        """
+        feature_name = FeatureName("any_name")
+        options = Options(context={"operation": "invalid_op"})
+
+        result = MockFeatureGroup.match_feature_group_criteria(feature_name, options)
+
+        assert result is False
+
+    def test_match_feature_group_criteria_missing_required_property(self) -> None:
+        """Test that matching fails when required property is missing."""
+        feature_name = FeatureName("any_name")
+        options = Options(context={})
+
+        result = MockFeatureGroup.match_feature_group_criteria(feature_name, options)
+
+        assert result is False
+
+
+class TestFeatureChainParserMixinValidateStringMatchHook:
+    """Tests for _validate_string_match() hook."""
+
+    def test_validate_string_match_hook_called_and_accepts(self) -> None:
+        """Test that hook is called and accepts valid operations."""
+        feature_name = FeatureName("source__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        result = MockFeatureGroupWithValidationHook.match_feature_group_criteria(feature_name, options)
+
+        assert result is True
+
+    def test_validate_string_match_hook_called_and_rejects(self) -> None:
+        """Test that hook is called and can reject based on custom logic."""
+        feature_name = FeatureName("source__reject_me_test")
+        options = Options(context={"operation": "reject_me"})
+
+        result = MockFeatureGroupWithValidationHook.match_feature_group_criteria(feature_name, options)
+
+        assert result is False
+
+    def test_validate_string_match_hook_not_called_for_config_based(self) -> None:
+        """Test that hook is not called for config-based matching."""
+        feature_name = FeatureName("simple_name")
+        options = Options(context={"operation": "op1", "in_features": "source_feature"})
+
+        # Should succeed via config-based matching without calling hook
+        result = MockFeatureGroupWithValidationHook.match_feature_group_criteria(feature_name, options)
+
+        assert result is True
+
+
+class TestFeatureChainParserMixinCustomSeparator:
+    """Tests for custom source feature separator."""
+
+    def test_custom_source_feature_separator(self) -> None:
+        """Test using comma as source feature separator instead of ampersand."""
+        feature_name = FeatureName("feat1,feat2,feat3__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroupCustomSeparator()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 3
+        assert Feature("feat1") in result
+        assert Feature("feat2") in result
+        assert Feature("feat3") in result
+
+    def test_custom_separator_does_not_parse_ampersand(self) -> None:
+        """Test that ampersand is not treated as separator with custom separator."""
+        feature_name = FeatureName("feat1&feat2__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroupCustomSeparator()
+        result = mock_fg.input_features(options, feature_name)
+
+        # Should treat "feat1&feat2" as a single feature name
+        assert result is not None
+        assert len(result) == 1
+        assert Feature("feat1&feat2") in result
+
+
+class TestFeatureChainParserMixinEdgeCases:
+    """Tests for edge cases and error handling."""
+
+    def test_input_features_empty_feature_name(self) -> None:
+        """Test handling of empty feature name."""
+        feature_name = FeatureName("__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroup()
+
+        # Empty source feature should fall back to config-based
+        with pytest.raises(ValueError):
+            mock_fg.input_features(options, feature_name)
+
+    def test_input_features_no_separator(self) -> None:
+        """Test feature name without double underscore separator."""
+        feature_name = FeatureName("simple_feature_name")
+        options = Options(
+            context={
+                DefaultOptionKeys.in_features: ["fallback_feature"],
+                "operation": "op1",
+            }
+        )
+
+        mock_fg = MockFeatureGroup()
+        result = mock_fg.input_features(options, feature_name)
+
+        # Should fall back to config-based
+        assert result is not None
+        assert Feature("fallback_feature") in result
+
+    def test_match_feature_group_criteria_with_string_feature_name(self) -> None:
+        """Test that match_feature_group_criteria accepts string feature names."""
+        feature_name_str = "source__op1_test"
+        options = Options(context={"operation": "op1"})
+
+        result = MockFeatureGroup.match_feature_group_criteria(feature_name_str, options)
+
+        assert result is True
+
+    def test_input_features_preserves_feature_order(self) -> None:
+        """Test that order of features is preserved in parsing."""
+        feature_name = FeatureName("first&second&third__op1_test")
+        options = Options(context={"operation": "op1"})
+
+        mock_fg = MockFeatureGroup()
+        result = mock_fg.input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 3
+        # Result is a set, so we just check all features are present
+        feature_names = {f.name for f in result}
+        assert feature_names == {"first", "second", "third"}
+
+
+class _MarkedAbortOptions(Options):
+    """Options whose in_features read raises the caller's own exception, so its identity stays assertable."""
+
+    marker: BaseException
+
+    def get_in_features(self) -> tuple[Feature, ...]:
+        raise self.marker
+
+
+# Every in_features value the matcher cannot resolve: get_in_features raises a ValueError on the falsy ones and a
+# TypeError on the truthy ones. The ids are explicit; pytest would name the two dicts value4 / value8 and give "" none.
+UNRESOLVABLE_IN_FEATURES = ["", 0, 0.0, False, {}, 5, 1.5, True, {"a": 1}]
+UNRESOLVABLE_IDS = "empty_str zero_int zero_float false empty_dict int float true non_empty_dict".split()
+
+
+class TestFeatureChainParserMixinMinMaxInFeatures:
+    """Tests for MIN_IN_FEATURES / MAX_IN_FEATURES enforcement in match_feature_group_criteria."""
+
+    def test_rejects_too_few_in_features(self) -> None:
+        """Config-based feature with fewer in_features than MIN_IN_FEATURES should not match."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": "single_feature",
+            }
+        )
+        # MockFeatureGroupWithMinMax has MIN_IN_FEATURES=2
+        result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        assert result is False
+
+    def test_rejects_too_many_in_features(self) -> None:
+        """Config-based feature with more in_features than MAX_IN_FEATURES should not match."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": frozenset({Feature("a"), Feature("b"), Feature("c"), Feature("d")}),
+            }
+        )
+        # MockFeatureGroupWithMinMax has MAX_IN_FEATURES=3
+        result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        assert result is False
+
+    def test_accepts_in_features_within_range(self) -> None:
+        """Config-based feature with in_features count within MIN/MAX should match."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": frozenset({Feature("a"), Feature("b")}),
+            }
+        )
+        # MockFeatureGroupWithMinMax has MIN=2, MAX=3
+        result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        assert result is True
+
+    def test_accepts_at_max_in_features(self) -> None:
+        """Config-based feature with exactly MAX_IN_FEATURES should match."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": frozenset({Feature("a"), Feature("b"), Feature("c")}),
+            }
+        )
+        # MockFeatureGroupWithMinMax has MAX_IN_FEATURES=3
+        result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        assert result is True
+
+    def test_absent_in_features_counts_as_zero_sources(self) -> None:
+        """When in_features is not in options, it counts as zero sources, below MIN=2."""
+        options = Options(context={"operation": "op1"})
+        result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        assert result is False
+
+    def test_default_min_max_allows_single(self) -> None:
+        """Default MIN=1, MAX=None allows any count of in_features."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": "single_feature",
+            }
+        )
+        # MockFeatureGroup has default MIN=1, MAX=None
+        result = MockFeatureGroup.match_feature_group_criteria("any_name", options)
+        assert result is True
+
+    def test_missing_min_max_attributes_skips_validation(self) -> None:
+        """When MIN/MAX_IN_FEATURES attributes are absent, validation is skipped."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": "single_feature",
+            }
+        )
+        assert not hasattr(MockFeatureGroupWithoutMinMax, "MIN_IN_FEATURES")
+        assert not hasattr(MockFeatureGroupWithoutMinMax, "MAX_IN_FEATURES")
+        result = MockFeatureGroupWithoutMinMax.match_feature_group_criteria("any_name", options)
+        assert result is True
+
+    def test_rejects_in_features_shape_it_cannot_count(self) -> None:
+        """Join tuples (the shape SourceInputFeature stores) are not countable in_features: a non-match.
+
+        Skipping the MIN/MAX check for an uncountable value accepts the feature, which is the one
+        answer that cannot be right: the cap says at most one in_feature.
+        """
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": [("a", 1), ("b", 2), ("c", 3)],
+            }
+        )
+        result = MockFeatureGroupSingleInFeature.match_feature_group_criteria("any_name", options)
+        assert result is False
+
+    def test_rejects_in_features_holding_uncountable_values(self) -> None:
+        """A plain typo (in_features=[1, 2, 3]) is uncountable too, and must not slip past the cap."""
+        options = Options(
+            context={
+                "operation": "op1",
+                "in_features": [1, 2, 3],
+            }
+        )
+        result = MockFeatureGroupSingleInFeature.match_feature_group_criteria("any_name", options)
+        assert result is False
+
+    @pytest.mark.parametrize("value", UNRESOLVABLE_IN_FEATURES, ids=UNRESOLVABLE_IDS)
+    def test_unresolvable_in_features_is_a_plain_non_match(self, value: Any) -> None:
+        """An in_features value the matcher cannot resolve is a non-match, never a raise."""
+        options = Options(context={"operation": "op1", "in_features": value})
+        result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        assert result is False
+
+    @pytest.mark.parametrize("value", ["", {"a": 1}], ids=["falsy_empty_str", "truthy_dict"])
+    def test_unresolvable_in_features_logs_one_debug_line_carrying_the_value(
+        self, value: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The rejection is readable at DEBUG, carries the offending value, and stays quiet above DEBUG."""
+        options = Options(context={"operation": "op1", "in_features": value})
+        with caplog.at_level(logging.DEBUG, logger=MIXIN_LOGGER_NAME):
+            result = MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+        records = [record for record in caplog.records if record.name == MIXIN_LOGGER_NAME]
+        debugs = [record.getMessage() for record in records if record.levelno == logging.DEBUG]
+        loud = [record.getMessage() for record in records if record.levelno >= logging.WARNING]
+
+        assert result is False
+        assert len(debugs) == 1, f"exactly one DEBUG record must report the rejection, got: {debugs}"
+        assert repr(value) in debugs[0], f"the DEBUG record must carry the offending value: {debugs[0]}"
+        assert loud == [], f"an unresolvable value is one group's non-match, not a defect, got: {loud}"
+
+    def test_absent_in_features_still_matches_when_min_is_zero(self) -> None:
+        """A group with MIN_IN_FEATURES = 0 is unaffected by an absent in_features."""
+        options = Options(context={"operation": "op1"})
+        assert MockFeatureGroupMinZero.match_feature_group_criteria("any_name", options) is True
+
+    def test_recognition_only_group_needs_a_source_off_the_name_path(self) -> None:
+        """A name-recognized group matches by name; by configuration it needs at least one in_feature."""
+
+        class UpperGroup(FeatureChainParserMixin):
+            PREFIX_PATTERN = r".*__upper$"
+            RECOGNITION_ONLY_PATTERN = True
+            MIN_IN_FEATURES = 1
+            MAX_IN_FEATURES = 1
+            PROPERTY_MAPPING = {"upper_mode": property_spec("How to upper-case")}
+
+        options = Options(context={"upper_mode": "all"})
+        with_empty = Options(context={"upper_mode": "all", "in_features": []})
+        with_source = Options(context={"upper_mode": "all", "in_features": ["src"]})
+        assert UpperGroup.match_feature_group_criteria("word__upper", options) is True
+        assert UpperGroup.match_feature_group_criteria("word", options) is False
+        assert UpperGroup.match_feature_group_criteria("word", with_empty) is False
+        assert UpperGroup.match_feature_group_criteria("word", with_source) is True
+
+    def test_none_in_features_counts_as_zero_sources(self) -> None:
+        """An explicit None counts as zero sources exactly like an absent key, below MIN=2."""
+        options = Options(context={"operation": "op1", "in_features": None})
+        assert MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options) is False
+
+    @pytest.mark.parametrize("explicit_none", [False, True], ids=["absent", "none"])
+    def test_declared_in_features_default_keeps_the_gate_open(self, explicit_none: bool) -> None:
+        """A real in_features default is materialized at intake, so an absent or None value still matches."""
+
+        class DefaultedSourceGroup(FeatureChainParserMixin):
+            MIN_IN_FEATURES = 1
+            PROPERTY_MAPPING = {
+                "operation": PropertySpec(
+                    "Operation to apply",
+                    allowed_values={"op1": "Operation 1"},
+                    context=True,
+                    strict_validation=True,
+                ),
+                "in_features": PropertySpec("source", default=["defaulted_src"]),
+            }
+
+        context: dict[str, Any] = {"operation": "op1"}
+        if explicit_none:
+            context["in_features"] = None
+        assert DefaultedSourceGroup.match_feature_group_criteria("any_name", Options(context=context)) is True
+
+    @pytest.mark.parametrize("value", [["a", "b"], []], ids=["too_many", "empty"])
+    def test_declared_in_features_default_does_not_exempt_a_supplied_value(self, value: list[str]) -> None:
+        """Only an absent or None in_features skips the count; a supplied value is still held to MIN/MAX."""
+
+        class CappedDefaultedGroup(FeatureChainParserMixin):
+            MIN_IN_FEATURES = 1
+            MAX_IN_FEATURES = 1
+            PROPERTY_MAPPING = {
+                "operation": PropertySpec(
+                    "Operation to apply",
+                    allowed_values={"op1": "Operation 1"},
+                    context=True,
+                    strict_validation=True,
+                ),
+                "in_features": PropertySpec("source", default=["defaulted_src"]),
+            }
+
+        absent = Options(context={"operation": "op1"})
+        supplied = Options(context={"operation": "op1", "in_features": value})
+        assert CappedDefaultedGroup.match_feature_group_criteria("any_name", absent) is True
+        assert CappedDefaultedGroup.match_feature_group_criteria("any_name", supplied) is False
+
+    @pytest.mark.parametrize("value", [[], (), frozenset()], ids=["empty_list", "empty_tuple", "empty_frozenset"])
+    def test_empty_collection_still_counts_as_zero_in_features(self, value: Any) -> None:
+        """Regression pin: an empty collection means zero in_features, below MIN=2."""
+        options = Options(context={"operation": "op1", "in_features": value})
+        assert MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options) is False
+
+    def test_resolvable_in_features_still_matches(self) -> None:
+        """Regression pin: a value the matcher can count keeps its current behavior."""
+        options = Options(context={"operation": "op1", "in_features": frozenset({Feature("a"), Feature("b")})})
+        assert MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options) is True
+
+    @pytest.mark.parametrize("error_type", [ValueError, TypeError], ids=["value_error", "type_error"])
+    def test_marked_match_abort_still_escapes_the_in_features_gate(self, error_type: type[Exception]) -> None:
+        """A raise marked with escalate_match_abort crosses the matcher as the SAME object, never contained."""
+        marker = escalate_match_abort(error_type(ABORT_MESSAGE))
+        # A resolvable-looking raw value, so the gate gets as far as calling get_in_features at all.
+        options = _MarkedAbortOptions(context={"operation": "op1", "in_features": ["a", "b"]})
+        options.marker = marker
+        with pytest.raises(error_type) as exc_info:
+            MockFeatureGroupWithMinMax.match_feature_group_criteria("any_name", options)
+
+        assert exc_info.value is marker, f"the marked exception itself must escape, got: {exc_info.value!r}"
+
+
+class TestFeatureChainParserMixinInFeatureCountParity:
+    """Match gate, _extract_source_features and input_features count duplicates the same way."""
+
+    def test_duplicate_over_max_is_rejected_everywhere(self) -> None:
+        options = Options(context={"operation": "op1", "in_features": ["a", "b", "b", "b"]})
+        feature = Feature(name="simple_name", options=options)
+
+        assert MockFeatureGroupWithMinMax.match_feature_group_criteria("simple_name", options) is False
+        assert MockFeatureGroupWithMinMax._extract_source_features(feature) == ["a", "b", "b", "b"]
+        with pytest.raises(ValueError, match="allows at most 3 in_feature"):
+            MockFeatureGroupWithMinMax().input_features(options, FeatureName("simple_name"))
+
+    def test_duplicate_within_max_matches(self) -> None:
+        options = Options(context={"operation": "op1", "in_features": ["a", "a"]})
+        feature = Feature(name="simple_name", options=options)
+
+        assert MockFeatureGroupWithMinMax.match_feature_group_criteria("simple_name", options) is True
+        assert MockFeatureGroupWithMinMax._extract_source_features(feature) == ["a", "a"]
+
+
+class TestFeatureChainParserMixinInFeatureCountPublicApi:
+    """in_feature_count_reason and validate_in_feature_count are public classmethods."""
+
+    def test_reason_is_generic_out_of_range(self) -> None:
+        assert "at least 2 in_feature" in str(MockFeatureGroupWithMinMax.in_feature_count_reason("f", 1))
+        assert "at most 3 in_feature" in str(MockFeatureGroupWithMinMax.in_feature_count_reason("f", 4))
+
+    def test_reason_is_none_in_range(self) -> None:
+        assert MockFeatureGroupWithMinMax.in_feature_count_reason("f", 2) is None
+        assert MockFeatureGroupWithMinMax.in_feature_count_reason("f", 3) is None
+
+    def test_validate_raises_the_reason_out_of_range(self) -> None:
+        for count in (1, 4):
+            reason = MockFeatureGroupWithMinMax.in_feature_count_reason("f", count)
+            with pytest.raises(ValueError) as exc_info:
+                MockFeatureGroupWithMinMax.validate_in_feature_count("f", count)
+            assert str(exc_info.value) == reason
+
+    def test_validate_returns_none_in_range(self) -> None:
+        assert MockFeatureGroupWithMinMax.validate_in_feature_count("f", 2) is None
+
+    def test_private_names_are_removed(self) -> None:
+        assert not hasattr(FeatureChainParserMixin, "_in_feature_count_reason")
+        assert not hasattr(FeatureChainParserMixin, "_validate_in_feature_count")
+
+
+class TestFeatureChainParserMixinListValuedOptions:
+    """Tests for list-valued options in PROPERTY_MAPPING (issue #228)."""
+
+    def test_match_feature_group_criteria_list_valued_option(self) -> None:
+        """Test that match_feature_group_criteria works with list-valued options."""
+
+        class ListValuedFeatureGroup(FeatureChainParserMixin):
+            PROPERTY_MAPPING = {
+                "partition_by": PropertySpec(
+                    "List of columns to partition by",
+                    context=True,
+                    strict_validation=False,
+                ),
+            }
+
+        options = Options(context={"partition_by": ["region", "category"], "in_features": "src"})
+        result = ListValuedFeatureGroup.match_feature_group_criteria("my_feature", options)
+        assert result is True
+
+    def test_match_feature_group_criteria_tuple_valued_option(self) -> None:
+        """Test that match_feature_group_criteria works with tuple-valued options."""
+
+        class TupleValuedFeatureGroup(FeatureChainParserMixin):
+            PROPERTY_MAPPING = {
+                "partition_by": PropertySpec(
+                    "Columns to partition by",
+                    context=True,
+                    strict_validation=False,
+                ),
+            }
+
+        options = Options(context={"partition_by": ("region", "category"), "in_features": "src"})
+        result = TupleValuedFeatureGroup.match_feature_group_criteria("my_feature", options)
+        assert result is True
+
+    def test_list_valued_option_preserves_order(self) -> None:
+        """Test that list-valued options preserve element order through tuple conversion."""
+        from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import FeatureChainParser
+
+        property_mapping = {
+            "partition_by": PropertySpec(
+                "Columns to partition by",
+                context=True,
+                strict_validation=False,
+            ),
+        }
+        options = Options(context={"partition_by": ["col1", "col2", "col3"]})
+        result = FeatureChainParser._validate_options_against_property_mapping(options, property_mapping)
+        assert result is True
+
+    def test_scalar_option_still_works(self) -> None:
+        """Test that scalar (non-list) options still work after the fix."""
+        options = Options(context={"operation": "op1", "in_features": "src"})
+        result = MockFeatureGroup.match_feature_group_criteria("my_feature", options)
+        assert result is True
+
+
+class TestFeatureChainParserMixinExtractSourceFeatures:
+    """Tests for _extract_source_features() classmethod."""
+
+    def test_extract_source_features_string_based_single(self) -> None:
+        """Test extraction from feature name with single source feature."""
+        feature = Feature(
+            name="source_feature__op1_test",
+            options=Options(context={"operation": "op1"}),
+        )
+
+        result = MockFeatureGroup._extract_source_features(feature)
+
+        assert result == ["source_feature"]
+
+    def test_extract_source_features_string_based_multiple(self) -> None:
+        """Test extraction from feature name with multiple source features (ampersand separator)."""
+        feature = Feature(
+            name="feat1&feat2&feat3__op1_test",
+            options=Options(context={"operation": "op1"}),
+        )
+
+        result = MockFeatureGroup._extract_source_features(feature)
+
+        assert result == ["feat1", "feat2", "feat3"]
+
+    @pytest.mark.parametrize("in_features", [["feature_a", "feature_b"], ["feature_b", "feature_a"]])
+    def test_extract_source_features_config_based_fallback(self, in_features: list[str]) -> None:
+        """Test that when string parsing fails, it falls back to feature.options.get_in_features()."""
+        feature = Feature(
+            name="simple_name",
+            options=Options(
+                context={
+                    DefaultOptionKeys.in_features: in_features,
+                    "operation": "op1",
+                }
+            ),
+        )
+
+        result = MockFeatureGroup._extract_source_features(feature)
+
+        assert result == in_features
+        assert all(type(name) is str for name in result), [type(name) for name in result]
+
+    def test_extract_source_features_custom_separator(self) -> None:
+        """Test extraction with custom separator (comma instead of ampersand)."""
+        feature = Feature(
+            name="feat1,feat2,feat3__op1_test",
+            options=Options(context={"operation": "op1"}),
+        )
+
+        result = MockFeatureGroupCustomSeparator._extract_source_features(feature)
+
+        assert result == ["feat1", "feat2", "feat3"]
+
+
+class TestFeatureChainParserMixinSourceAgreement:
+    """input_features, _extract_source_features and the resolution read the same sources."""
+
+    @pytest.mark.parametrize("name", ["feat1__op1_test", "feat1&feat2&feat3__op1_test"])
+    def test_all_source_readers_agree_for_an_owned_name(self, name: str) -> None:
+        options = Options(context={"operation": "op1"})
+        via_input = MockFeatureGroup().input_features(options, FeatureName(name))
+        assert via_input is not None
+
+        via_extract = MockFeatureGroup._extract_source_features(Feature(name, options=options))
+        via_validated = MockFeatureGroup._extract_validated_source_features(Feature(name, options=options))
+        via_resolution = MockFeatureGroup.resolve_feature_name(name).sources
+
+        assert {f.name for f in via_input} == set(via_extract) == set(via_resolution)
+        assert via_extract == via_validated == list(via_resolution)
+
+
+class TestFeatureChainParserMixinExtractSingleSourceFeature:
+    """Tests for _extract_single_source_feature() classmethod."""
+
+    def test_extract_single_source_feature_string_based(self) -> None:
+        """A feature name that string-parses to exactly one source returns that source."""
+        feature = Feature(
+            name="source_feature__op1_test",
+            options=Options(context={"operation": "op1"}),
+        )
+
+        result = MockFeatureGroupSingleInFeature._extract_single_source_feature(feature)
+
+        assert result == "source_feature"
+
+    def test_extract_single_source_feature_config_based_fallback(self) -> None:
+        """A non-parsing name falls back to the single in_features option value."""
+        feature = Feature(
+            name="simple_name",
+            options=Options(context={DefaultOptionKeys.in_features: ["feature_a"], "operation": "op1"}),
+        )
+
+        result = MockFeatureGroupSingleInFeature._extract_single_source_feature(feature)
+
+        assert result == "feature_a"
+        assert type(result) is str, type(result)
+        assert repr(result) == "'feature_a'"
+
+    def test_extract_single_source_feature_raises_generic_message_for_zero_sources(self) -> None:
+        """Zero resolved sources raise the generic MIN_IN_FEATURES-based message."""
+        feature = Feature(name="simple_name", options=Options(context={"operation": "op1"}))
+
+        with pytest.raises(ValueError) as exc_info:
+            MockFeatureGroupZeroSources._extract_single_source_feature(feature)
+
+        assert "at least 1 in_feature" in str(exc_info.value)
+
+    def test_extract_single_source_feature_raises_generic_message_for_too_many_sources(self) -> None:
+        """Two resolved sources against MAX_IN_FEATURES=1 raise the generic MAX-based message."""
+        feature = Feature(
+            name="simple_name",
+            options=Options(context={DefaultOptionKeys.in_features: ["feature_a", "feature_b"], "operation": "op1"}),
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            MockFeatureGroupSingleInFeature._extract_single_source_feature(feature)
+
+        assert "at most 1 in_feature" in str(exc_info.value)
+
+    def test_extract_single_source_feature_raises_custom_message_when_overridden(self) -> None:
+        """A subclass override of in_feature_count_reason wins over the generic wording."""
+        feature = Feature(
+            name="simple_name",
+            options=Options(context={DefaultOptionKeys.in_features: ["feature_a", "feature_b"], "operation": "op1"}),
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            MockFeatureGroupSingleInFeatureCustomReason._extract_single_source_feature(feature)
+
+        assert (
+            str(exc_info.value) == "MockFeatureGroupSingleInFeatureCustomReason needs exactly one input column; got 2."
+        )
+
+    def test_extract_single_source_feature_raises_for_two_sources_when_max_unbounded(self) -> None:
+        """An unbounded MAX_IN_FEATURES must still reject 2 resolved sources, not silently pick one."""
+        feature = Feature(
+            name="simple_name",
+            options=Options(context={DefaultOptionKeys.in_features: ["feature_a", "feature_b"], "operation": "op1"}),
+        )
+
+        with pytest.raises(ValueError):
+            MockFeatureGroupNoMaxDeclared._extract_single_source_feature(feature)
+
+    def test_extract_single_source_feature_raises_value_error_not_index_error_when_min_zero(self) -> None:
+        """MIN_IN_FEATURES=0 leaves the reason hook silent at zero sources; must still raise ValueError."""
+        feature = Feature(name="simple_name", options=Options(context={"operation": "op1"}))
+
+        with pytest.raises(ValueError):
+            MockFeatureGroupMinZero._extract_single_source_feature(feature)
+
+    def test_extract_single_source_feature_raises_for_empty_operand(self) -> None:
+        with pytest.raises(ValueError, match="empty in_feature operand"):
+            MockFeatureGroupSingleInFeature._extract_single_source_feature(_config_feature([""]))
+
+
+def _config_feature(in_features: list[str]) -> Feature:
+    return Feature(
+        name="simple_name",
+        options=Options(context={DefaultOptionKeys.in_features: in_features, "operation": "op1"}),
+    )
+
+
+class TestFeatureChainParserMixinExtractValidatedSourceFeatures:
+    """Tests for _extract_validated_source_features() classmethod."""
+
+    def test_raises_for_too_few_sources(self) -> None:
+        with pytest.raises(ValueError, match="at least 2 in_feature"):
+            MockFeatureGroupWithMinMax._extract_validated_source_features(_config_feature(["feature_a"]))
+
+    def test_raises_for_too_many_sources(self) -> None:
+        with pytest.raises(ValueError, match="at most 3 in_feature"):
+            MockFeatureGroupWithMinMax._extract_validated_source_features(_config_feature(["a", "b", "c", "d"]))
+
+    @pytest.mark.parametrize("in_features", [["feature_a", "feature_b"], ["feature_b", "feature_a", "feature_c"]])
+    def test_returns_sources_in_declared_order_config_based(self, in_features: list[str]) -> None:
+        result = MockFeatureGroupWithMinMax._extract_validated_source_features(_config_feature(in_features))
+
+        assert result == in_features
+        assert all(type(name) is str for name in result)
+
+    def test_raises_for_empty_operand(self) -> None:
+        feature = _config_feature(["feature_a", ""])
+
+        with pytest.raises(ValueError) as exc_info:
+            MockFeatureGroupWithMinMax._extract_validated_source_features(feature)
+
+        expected = MockFeatureGroupWithMinMax.source_features_reason(feature.name, ["feature_a", ""])
+        assert expected is not None
+        assert "empty in_feature operand" in expected
+        assert str(exc_info.value) == expected
+
+
+def _constant_operation_extractor(_feature: Feature) -> str:
+    """An extract_fn stand-in that always resolves to a fixed, non-None operation value."""
+    return "op1"
+
+
+class TestFeatureChainParserMixinExtractOperationAndSourceFeature:
+    """Regression tests for _extract_operation_and_source_feature()."""
+
+    def test_raises_value_error_not_index_error_for_zero_sources(self) -> None:
+        """Zero resolved sources with a non-None operation must raise ValueError, not IndexError."""
+        feature = Feature(name="simple_name", options=Options(context={"operation": "op1"}))
+
+        with pytest.raises(ValueError) as exc_info:
+            MockFeatureGroupZeroSources._extract_operation_and_source_feature(
+                feature, _constant_operation_extractor, "operation"
+            )
+
+        assert "at least 1 in_feature" in str(exc_info.value)

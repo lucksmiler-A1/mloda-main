@@ -1,0 +1,441 @@
+"""
+Test simplified mloda data parameter for mloda.run_all().
+
+These tests verify that run_all() accepts api_data as a simple dict.
+The ApiInputDataCollection is created automatically from the dict structure.
+
+Simplified mloda:
+    result = mloda.run_all(
+        features,
+        api_data={"KeyName": {"col1": [1, 2], "col2": ["a", "b"]}}
+    )
+"""
+
+from typing import Any
+
+import pytest
+
+from mloda.user import mloda
+from mloda.provider import FeatureGroup
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.provider import FeatureSet
+from mloda.user import Index
+from mloda.provider import BaseInputData
+from mloda.provider import DataCreator
+from mloda.user import Link, JoinSpec
+from mloda.user import Options
+from mloda.user import PluginCollector
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+from mloda.provider import ApiInputDataFeature
+
+
+# ============================================================================
+# Test Feature: Simple mloda Consumer
+# ============================================================================
+class SimpleApiFeature(FeatureGroup):
+    """A simple feature that consumes mloda data."""
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        """Define input features from mloda data."""
+        return {
+            Feature(name="api_id", index=Index(("api_id",))),
+            Feature(name="api_value", index=Index(("api_id",))),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        """Concatenate mloda columns."""
+        data["SimpleApiFeature"] = data["api_id"].astype(str) + "_" + data["api_value"]
+        return data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {cls.get_class_name()}
+
+
+# ============================================================================
+# Test Feature: Multi-key mloda Consumer
+# ============================================================================
+class MultiKeyApiFeature(FeatureGroup):
+    """A feature that consumes data from multiple mloda keys."""
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        """Define input features from multiple mloda data sources."""
+        # This will require data from both FirstKey and SecondKey
+        return {
+            Feature(name="first_id", index=Index(("first_id",))),
+            Feature(name="second_value", index=Index(("second_id",))),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        """Combine data from multiple keys."""
+        data["MultiKeyApiFeature"] = data["first_id"].astype(str) + "_" + data["second_value"]
+        return data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {cls.get_class_name()}
+
+
+# ============================================================================
+# Test Feature: Joined with Creator
+# ============================================================================
+class CreatorDataFeature(FeatureGroup):
+    """Creates its own data via DataCreator."""
+
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({"creator_id", "creator_value"})
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {"creator_id": [1, 2, 3], "creator_value": ["a", "b", "c"]}
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {"creator_id", "creator_value"}
+
+
+class SimplifiedApiJoinFeature(FeatureGroup):
+    """Joins simplified mloda data with Creator data using LEFT join."""
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        """Define input features with a LEFT join link."""
+        # Create the link: LEFT join on api_id = creator_id
+        link = Link.left(
+            JoinSpec(ApiInputDataFeature, Index(("api_id",))), JoinSpec(CreatorDataFeature, Index(("creator_id",)))
+        )
+
+        return {
+            Feature(name="api_value", link=link, index=Index(("api_id",))),
+            Feature(name="creator_value", index=Index(("creator_id",))),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        # Combine the joined data
+        data["SimplifiedApiJoinFeature"] = data["api_value"].fillna("") + "_" + data["creator_value"].fillna("")
+        return data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {cls.get_class_name()}
+
+
+# ============================================================================
+# Test Class
+# ============================================================================
+class TestSimplifiedApiData:
+    """Tests for simplified api_data parameter in mloda.run_all()."""
+
+    _enabled_simple = PluginCollector.enabled_feature_groups(
+        {
+            ApiInputDataFeature,
+            SimpleApiFeature,
+        }
+    )
+
+    _enabled_multikey = PluginCollector.enabled_feature_groups(
+        {
+            ApiInputDataFeature,
+            MultiKeyApiFeature,
+        }
+    )
+
+    _enabled_join = PluginCollector.enabled_feature_groups(
+        {
+            ApiInputDataFeature,
+            CreatorDataFeature,
+            SimplifiedApiJoinFeature,
+        }
+    )
+
+    def test_simplified_api_data_single_key(self) -> None:
+        """
+        Test that run_all() accepts simplified api_data dict with a single key.
+
+        This test verifies the NEW simplified mloda:
+            api_data={"KeyName": {"col1": [...], "col2": [...]}}
+
+        Instead of the OLD verbose mloda:
+            api_input_data_collection = ApiInputDataCollection()
+            api_data = api_input_data_collection.setup_key_api_data(...)
+            run_all(..., api_input_data_collection=..., api_data=...)
+
+        Expected behavior:
+        - run_all() should auto-create ApiInputDataCollection internally
+        - api_data dict keys become the collection key names
+        - api_data dict values contain the actual column data
+        """
+        # NEW simplified mloda - just pass a dict!
+        api_data = {
+            "ApiExample": {
+                "api_id": [1, 2, 3, 4],
+                "api_value": ["w", "x", "y", "z"],
+            }
+        }
+
+        feature_list: list[Feature | str] = [Feature(name="SimpleApiFeature")]
+
+        result = mloda.run_all(
+            feature_list,
+            plugin_collector=self._enabled_simple,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,  # No api_input_data_collection needed!
+        )
+
+        # Validate result
+        assert len(result) == 1
+        df = result[0]
+        assert "SimpleApiFeature" in df.columns
+        assert len(df) == 4
+        assert df["SimpleApiFeature"].tolist() == ["1_w", "2_x", "3_y", "4_z"]
+
+    def test_simplified_api_data_multiple_keys(self) -> None:
+        """
+        Test that run_all() accepts simplified api_data dict with multiple keys.
+
+        This verifies that multiple mloda data sources can be registered in a single dict.
+        The test uses only one key's data - combining data from multiple keys requires Links.
+        """
+        api_data = {
+            "FirstKey": {
+                "api_id": [1, 2],
+                "api_value": ["a", "b"],
+            },
+            "SecondKey": {
+                "second_id": [3, 4],
+                "second_value": ["c", "d"],
+            },
+        }
+
+        # Use SimpleApiFeature which only needs api_id and api_value (from FirstKey)
+        feature_list: list[Feature | str] = [Feature(name="SimpleApiFeature")]
+
+        result = mloda.run_all(
+            feature_list,
+            plugin_collector=self._enabled_simple,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+        )
+
+        # Validate result - should work even with extra unused keys
+        assert len(result) == 1
+        df = result[0]
+        assert "SimpleApiFeature" in df.columns
+        assert len(df) == 2
+        assert df["SimpleApiFeature"].tolist() == ["1_a", "2_b"]
+
+    def test_requested_features_from_two_api_data_sets_return_separate_results(self) -> None:
+        result = mloda.run_all(
+            ["a", "b"],
+            compute_frameworks=[PythonDictFramework],
+            api_data={"first": {"a": ["one"]}, "second": {"b": ["one", "two"]}},
+        )
+
+        frames = [dict(frame) for frame in result]
+        assert len(frames) == 2, f"both requested features must be returned in separate frames, got {frames!r}"
+        assert {next(iter(frame)) for frame in frames} == {"a", "b"}
+        assert {tuple(frame): tuple(next(iter(frame.values()))) for frame in frames} == {
+            ("a",): ("one",),
+            ("b",): ("one", "two"),
+        }
+
+    def test_features_from_same_api_data_set_share_a_frame(self) -> None:
+        result = mloda.run_all(
+            ["a", "a2", "b"],
+            compute_frameworks=[PythonDictFramework],
+            api_data={"first": {"a": [1], "a2": [2]}, "second": {"b": [1, 2]}},
+        )
+
+        frames = sorted((dict(frame) for frame in result), key=lambda frame: sorted(frame))
+        assert frames == [{"a": [1], "a2": [2]}, {"b": [1, 2]}]
+
+    def test_derived_feature_needing_two_api_data_sets_raises_without_link(self) -> None:
+        with pytest.raises(ValueError, match=r"(?s)MultiKeyApiFeature.*missing Links"):
+            mloda.run_all(
+                [Feature(name="MultiKeyApiFeature")],
+                plugin_collector=self._enabled_multikey,
+                compute_frameworks=[PandasDataFrame],
+                api_data={"First": {"first_id": [1, 2]}, "Second": {"second_id": [1, 2], "second_value": ["x", "y"]}},
+            )
+
+    def test_missing_links_error_ignores_unrelated_api_source_partition(self) -> None:
+        """Regression pin (codex finding): ApiInputDataFeature partitions its own bucket further by
+        API source key. MultiKeyApiFeature spans two source-key partitions of ApiInputDataFeature
+        that share identical Options (no option differs between 'First' and 'Second'); a third,
+        unrelated top-level request for 'first_id' with an actual option ('unit') creates a genuinely
+        differing bucket elsewhere. The resulting missing-Links error must not blame a differing
+        option, since the two partitions MultiKeyApiFeature itself spans never differed by Options,
+        only by source key."""
+        with pytest.raises(ValueError, match=r"(?s)MultiKeyApiFeature.*missing Links") as exc_info:
+            mloda.run_all(
+                [
+                    Feature(name="MultiKeyApiFeature"),
+                    Feature(name="first_id", options={"unit": "x"}, index=Index(("first_id",))),
+                ],
+                plugin_collector=self._enabled_multikey,
+                compute_frameworks=[PandasDataFrame],
+                api_data={"First": {"first_id": [1, 2]}, "Second": {"second_id": [1, 2], "second_value": ["x", "y"]}},
+            )
+
+        assert "differing option" not in str(exc_info.value).lower(), (
+            "MultiKeyApiFeature spans two ApiInputDataFeature source-key partitions with identical "
+            "Options; the unrelated 'unit' bucket from a third, disjoint request must not be blamed"
+        )
+
+    def test_duplicate_column_across_api_data_sets_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"(?s)(?=.*'a')(?=.*first)(?=.*second)"):
+            mloda.run_all(
+                ["a"],
+                compute_frameworks=[PythonDictFramework],
+                api_data={"first": {"a": [1]}, "second": {"a": [1, 2]}},
+            )
+
+    def test_simplified_api_data_two_keys_first_key_used(self) -> None:
+        """
+        Test that run_all() can register multiple mloda keys and use the first key's data.
+
+        This verifies that:
+        - Multiple mloda keys can be registered in a single api_data dict
+        - The first key's data is accessible via its column names
+        - Extra unused keys don't break the registration
+        """
+        api_data = {
+            "FirstKey": {
+                "first_id": [1, 2, 3],
+                "first_value": ["a", "b", "c"],
+            },
+            "SecondKey": {
+                "second_id": [10, 20],
+                "second_value": ["x", "y"],
+            },
+        }
+
+        # Request feature from first key
+        feature_list: list[Feature | str] = ["first_value"]
+
+        result = mloda.run_all(
+            feature_list,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+        )
+
+        assert len(result) == 1
+        df = result[0]
+        assert "first_value" in df.columns
+        assert len(df) == 3
+        assert df["first_value"].tolist() == ["a", "b", "c"]
+
+    def test_simplified_api_data_two_keys_second_key_used(self) -> None:
+        """
+        Test that run_all() can register multiple mloda keys and use the second key's data.
+
+        This verifies that:
+        - Multiple mloda keys can be registered in a single api_data dict
+        - The second key's data is accessible via its column names
+        - Extra unused keys don't break the registration
+        """
+        api_data = {
+            "FirstKey": {
+                "first_id": [1, 2, 3],
+                "first_value": ["a", "b", "c"],
+            },
+            "SecondKey": {
+                "second_id": [10, 20],
+                "second_value": ["x", "y"],
+            },
+        }
+
+        # Request feature from second key
+        feature_list: list[Feature | str] = ["second_value"]
+
+        result = mloda.run_all(
+            feature_list,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+        )
+
+        assert len(result) == 1
+        df = result[0]
+        assert "second_value" in df.columns
+        assert len(df) == 2
+        assert df["second_value"].tolist() == ["x", "y"]
+
+    def test_simplified_api_data_with_joins(self) -> None:
+        """
+        Test that simplified api_data works with Links/Joins.
+
+        This ensures the simplified mloda is compatible with existing
+        Link functionality (LEFT join, APPEND, etc).
+        """
+        api_data = {
+            "ApiExample": {
+                "api_id": [1, 2, 3, 4],
+                "api_value": ["w", "x", "y", "z"],
+            }
+        }
+
+        feature_list: list[Feature | str] = [Feature(name="SimplifiedApiJoinFeature")]
+
+        result = mloda.run_all(
+            feature_list,
+            plugin_collector=self._enabled_join,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+        )
+
+        # Validate result
+        assert len(result) == 1
+        df = result[0]
+        assert "SimplifiedApiJoinFeature" in df.columns
+        assert len(df) == 4  # LEFT join keeps all mloda rows
+
+    def test_none_api_data_still_works(self) -> None:
+        """
+        Test that passing None for api_data still works (no regression).
+
+        This ensures backward compatibility for features that don't use mloda data.
+        """
+        feature_list: list[Feature | str] = [Feature(name="creator_id")]
+
+        _enabled_creator_only = PluginCollector.enabled_feature_groups({CreatorDataFeature})
+
+        result = mloda.run_all(
+            feature_list,
+            plugin_collector=_enabled_creator_only,
+            compute_frameworks=[PandasDataFrame],
+            api_data=None,  # Explicitly None
+        )
+
+        # Validate result
+        assert len(result) == 1
+        df = result[0]
+        assert "creator_id" in df.columns
+        assert len(df) == 3
+
+    def test_empty_api_data_dict(self) -> None:
+        """
+        Test that passing an empty api_data dict behaves correctly.
+
+        Should either work (no mloda data) or raise a clear error.
+        """
+        feature_list: list[Feature | str] = [Feature(name="creator_id")]
+
+        _enabled_creator_only = PluginCollector.enabled_feature_groups({CreatorDataFeature})
+
+        result = mloda.run_all(
+            feature_list,
+            plugin_collector=_enabled_creator_only,
+            compute_frameworks=[PandasDataFrame],
+            api_data={},  # Empty dict
+        )
+
+        # Validate result
+        assert len(result) == 1
+        df = result[0]
+        assert "creator_id" in df.columns
+        assert len(df) == 3

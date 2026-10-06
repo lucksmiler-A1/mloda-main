@@ -1,0 +1,473 @@
+"""
+Base implementation for scikit-learn encoding feature groups.
+"""
+
+from __future__ import annotations
+
+import datetime
+from abc import abstractmethod
+from typing import Any
+
+from mloda.provider import FeatureGroup
+from mloda.user import Feature
+from mloda.provider import FeatureSet
+from mloda.provider import (
+    FeatureChainParserMixin,
+)
+from mloda.provider import COLUMNWISE_HOOKS
+from mloda.provider import BaseArtifact
+from mloda.provider import DefaultOptionKeys
+from mloda.provider import PropertySpec
+from mloda_plugins.feature_group.experimental.sklearn.sklearn_artifact import SklearnArtifact
+
+
+class EncodingFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+    """
+    Base class for scikit-learn encoding feature groups.
+
+    The EncodingFeatureGroup provides categorical encoding transformations for granular control
+    over categorical data preprocessing, using scikit-learn's encoding implementations. Supports
+    various encoding strategies for converting categorical variables to numerical representations.
+
+    ## Supported Operations
+
+    - `onehot`: OneHotEncoder - creates binary columns for each category
+    - `label`: LabelEncoder - converts categories to integer labels
+    - `ordinal`: OrdinalEncoder - converts categories to ordinal integers
+
+    Encoding features follow this naming pattern:
+    `{in_features}__{encoder_type}_encoded`
+
+    ## Feature Creation Methods
+
+    ### 1. String-Based Creation
+
+    Encoding features follow the naming pattern: `{source_feature}__{encoder_type}_encoded`
+
+    Examples:
+    ```python
+    features = [
+        "category__onehot_encoded",     # OneHot encode the category feature
+        "status__label_encoded",        # Label encode the status feature
+        "priority__ordinal_encoded"     # Ordinal encode the priority feature
+    ]
+    ```
+
+    ### 2. Configuration-Based Creation
+
+    Uses Options with proper group/context parameter separation:
+
+    ```python
+    from mloda.user import Feature
+    from mloda.user import Options
+    from mloda.provider import DefaultOptionKeys
+
+    feature = Feature(
+        name="placeholder",
+        options=Options(
+            context={
+                EncodingFeatureGroup.ENCODER_TYPE: "onehot",
+                DefaultOptionKeys.in_features: "category",
+            }
+        )
+    )
+    ```
+
+    ## Usage Examples
+
+    ### String-Based Creation
+
+    ```python
+    from mloda.user import Feature
+
+    # OneHot encoding - creates multiple binary columns
+    feature = Feature(name="product_category__onehot_encoded")
+    # Results in: product_category__onehot_encoded~cat1,
+    #             product_category__onehot_encoded~cat2, ...
+
+    # Label encoding - converts to single integer column
+    feature = Feature(name="customer_segment__label_encoded")
+
+    # Ordinal encoding - assigns ordered integer values
+    feature = Feature(name="education_level__ordinal_encoded")
+    ```
+
+    ### Configuration-Based Creation
+
+    ```python
+    from mloda.user import Feature
+    from mloda.user import Options
+
+    # OneHot encoding using configuration
+    feature = Feature(
+        name="placeholder",
+        options=Options(
+            context={
+                EncodingFeatureGroup.ENCODER_TYPE: "onehot",
+                DefaultOptionKeys.in_features: "department",
+            }
+        )
+    )
+
+    # Label encoding with configuration
+    feature = Feature(
+        name="placeholder",
+        options=Options(
+            context={
+                EncodingFeatureGroup.ENCODER_TYPE: "label",
+                DefaultOptionKeys.in_features: "risk_level",
+            }
+        )
+    )
+    ```
+
+    ### Multiple Result Columns
+
+    For encoders that produce multiple output columns (like OneHotEncoder), the feature group
+    uses mloda's multiple result columns pattern with the `~` separator:
+
+    ```python
+    # OneHot encoding of 'category' with 3 unique values produces:
+    # - category__onehot_encoded~value1
+    # - category__onehot_encoded~value2
+    # - category__onehot_encoded~value3
+    ```
+
+    ## Parameter Classification
+
+    ### Context Parameters (Default)
+    These parameters don't affect Feature Group resolution/splitting:
+    - `encoder_type`: Type of encoder to use (onehot, label, or ordinal)
+    - `in_features`: Source feature to encode
+
+    ### Group Parameters
+    Currently none for EncodingFeatureGroup. Parameters that affect Feature Group
+    resolution/splitting would be placed here.
+
+    ## Requirements
+
+    - Input data must contain the source feature to be encoded
+    - Source feature should contain categorical data
+    - Scikit-learn library must be installed
+    - For OneHotEncoder, all categories must be known during fitting
+
+    ## Additional Notes
+
+    - Encoding models are persisted as artifacts for consistent train/test encoding
+    - OneHotEncoder handles unknown categories during prediction
+    - LabelEncoder assigns integers in alphabetical order by default
+    - OrdinalEncoder preserves ordinal relationships if categories are properly ordered
+    """
+
+    # Option keys for encoding configuration
+    ENCODER_TYPE = "encoder_type"
+
+    # Supported encoder types
+    SUPPORTED_ENCODERS = {
+        "onehot": "OneHotEncoder",
+        "label": "LabelEncoder",
+        "ordinal": "OrdinalEncoder",
+    }
+
+    PREFIX_PATTERN = r".*__(?P<encoder_type>onehot|label|ordinal)_encoded(?:~\d+)?$"
+
+    # In-feature configuration for FeatureChainParserMixin
+    MIN_IN_FEATURES = 1
+    MAX_IN_FEATURES = 1
+
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
+
+    # Property mapping for new configuration-based approach
+    PROPERTY_MAPPING = {
+        ENCODER_TYPE: PropertySpec(
+            "Type of encoder to apply",
+            allowed_values=SUPPORTED_ENCODERS,
+            context=True,
+            strict_validation=True,
+        ),
+        DefaultOptionKeys.in_features: PropertySpec(
+            "Source feature to encode",
+            context=True,
+            strict_validation=False,
+        ),
+        SklearnArtifact.ARTIFACT_STORAGE_PATH: SklearnArtifact.ARTIFACT_STORAGE_PATH_SPEC,
+    }
+
+    @staticmethod
+    def artifact() -> type[BaseArtifact] | None:
+        """Return the artifact class for sklearn encoder persistence."""
+        return SklearnArtifact
+
+    @classmethod
+    def declared_source_names(cls, name_sources: list[str]) -> list[str]:
+        return [cls.get_column_base_feature(source) for source in name_sources]
+
+    @classmethod
+    def get_encoder_type(cls, feature_name: str) -> str:
+        """Extract the encoder type from the feature name."""
+        encoder_type = cls.resolve_feature_name(feature_name).value_for(cls.ENCODER_TYPE)
+        if encoder_type is None:
+            raise ValueError(f"Invalid encoding feature name format: {feature_name}")
+
+        if encoder_type not in cls.SUPPORTED_ENCODERS:
+            raise ValueError(
+                f"Unsupported encoder type: {encoder_type}. Supported types: {', '.join(cls.SUPPORTED_ENCODERS.keys())}"
+            )
+
+        return encoder_type
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        """
+        Apply scikit-learn encoders to features.
+
+        Processes all requested features, determining the encoder type
+        and source feature from either string parsing or configuration-based options.
+
+        Adds the encoding results directly to the input data structure.
+        """
+        # Process each requested feature
+        for feature in features.get_sorted_features():
+            encoder_type, source_feature = cls._extract_encoder_type_and_source_feature(feature)
+
+            # Remove ~suffix if present (for OneHot column patterns like category~1)
+            base_source_feature = cls.get_column_base_feature(source_feature)
+
+            # Check that source feature exists
+            cls._check_source_features_exist(data, [base_source_feature])
+
+            # Create unique artifact key that includes encoder type and source feature
+            # This ensures different encoders on different features get separate artifacts
+            artifact_key = f"{base_source_feature}__{encoder_type}_encoded"
+
+            # Try to load existing fitted encoder from artifact using helper method
+            fitted_encoder = None
+            artifact = SklearnArtifact.load_sklearn_artifact(features, artifact_key)
+            if artifact:
+                fitted_encoder = artifact["fitted_transformer"]
+                cls._encoder_matches_type(fitted_encoder, encoder_type)
+
+            # If no fitted encoder available, create and fit new one
+            if fitted_encoder is None:
+                fitted_encoder = cls._create_and_fit_encoder(data, base_source_feature, encoder_type)
+
+                # Save the fitted encoder as artifact using helper method
+                artifact_data = {
+                    "fitted_transformer": fitted_encoder,
+                    "feature_name": base_source_feature,
+                    "encoder_type": encoder_type,
+                    "training_timestamp": datetime.datetime.now().isoformat(),
+                }
+                SklearnArtifact.save_sklearn_artifact(features, artifact_key, artifact_data)
+
+            # Apply the fitted encoder to get results
+            result = cls._apply_encoder(data, base_source_feature, fitted_encoder)
+
+            # Add result to data (handling multiple columns for OneHotEncoder)
+            data = cls._add_result_to_data(data, feature.name, result)
+
+        return data
+
+    @classmethod
+    def _extract_encoder_type_and_source_feature(cls, feature: Feature) -> tuple[str, str]:
+        """
+        Extract encoder type and source feature name from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract parameters from
+
+        Returns:
+            Tuple of (encoder_type, source_feature_name)
+
+        Raises:
+            ValueError: If parameters cannot be extracted
+        """
+        return cls._extract_operation_and_source_feature(feature, cls._extract_encoder_type, "encoder type")
+
+    @classmethod
+    def _extract_encoder_type(cls, feature: Feature) -> str | None:
+        """
+        Extract encoder type from a feature.
+
+        Tries string-based parsing first, falls back to configuration-based approach.
+
+        Args:
+            feature: The feature to extract encoder type from
+
+        Returns:
+            Encoder type string, or None if not found
+
+        Raises:
+            ValueError: If encoder type is unsupported
+        """
+        encoder_type = cls._resolve_operation(feature, cls.ENCODER_TYPE)
+
+        if encoder_type is not None and encoder_type not in cls.SUPPORTED_ENCODERS:
+            raise ValueError(
+                f"Unsupported encoder type: {encoder_type}. Supported types: {', '.join(cls.SUPPORTED_ENCODERS.keys())}"
+            )
+
+        return str(encoder_type) if encoder_type is not None else None
+
+    @classmethod
+    def _import_sklearn_components(cls) -> dict[str, Any]:
+        """
+        Import sklearn components with fallback logic for different versions.
+
+        Returns:
+            Dictionary containing imported sklearn components
+
+        Raises:
+            ImportError: If sklearn is not available
+        """
+        components = {}
+
+        try:
+            from sklearn.preprocessing import OneHotEncoder, LabelEncoder, OrdinalEncoder
+
+            components.update(
+                {
+                    "OneHotEncoder": OneHotEncoder,
+                    "LabelEncoder": LabelEncoder,
+                    "OrdinalEncoder": OrdinalEncoder,
+                }
+            )
+
+        except ImportError:
+            raise ImportError(
+                "scikit-learn is required for EncodingFeatureGroup. Install with: pip install scikit-learn"
+            )
+
+        return components
+
+    @classmethod
+    def _create_encoder_instance(cls, encoder_type: str) -> Any:
+        """
+        Create an encoder instance based on the encoder type.
+
+        Args:
+            encoder_type: The type of encoder to create
+
+        Returns:
+            Encoder instance
+
+        Raises:
+            ValueError: If encoder type is not supported
+            ImportError: If sklearn is not available
+        """
+        if encoder_type not in cls.SUPPORTED_ENCODERS:
+            raise ValueError(
+                f"Unsupported encoder type: {encoder_type}. Supported types: {list(cls.SUPPORTED_ENCODERS.keys())}"
+            )
+
+        sklearn_components = cls._import_sklearn_components()
+        encoder_class_name = cls.SUPPORTED_ENCODERS[encoder_type]
+        encoder_class = sklearn_components[encoder_class_name]
+
+        # Configure encoder with appropriate parameters
+        if encoder_type == "onehot":
+            # OneHotEncoder: handle unknown categories gracefully, don't drop first column
+            return encoder_class(handle_unknown="ignore", drop=None)
+        elif encoder_type == "ordinal":
+            # OrdinalEncoder: handle unknown categories gracefully
+            return encoder_class(handle_unknown="use_encoded_value", unknown_value=-1)
+        else:
+            # LabelEncoder: default configuration
+            return encoder_class()
+
+    @classmethod
+    def _encoder_matches_type(cls, fitted_encoder: Any, encoder_type: str) -> bool:
+        """
+        Check if a fitted encoder matches the expected type.
+
+        Args:
+            fitted_encoder: The fitted encoder
+            encoder_type: The expected encoder type
+
+        Returns:
+            True if the encoder matches the type
+
+        Raises:
+            ValueError: If encoder type mismatch is detected
+        """
+        expected_class_name = cls.SUPPORTED_ENCODERS.get(encoder_type)
+        if expected_class_name is None:
+            raise ValueError(f"Unsupported encoder type: {encoder_type}")
+
+        actual_class_name: str = fitted_encoder.__class__.__name__
+        if actual_class_name != expected_class_name:
+            raise ValueError(
+                f"Artifact encoder type mismatch: expected {encoder_type} "
+                f"({expected_class_name}), but loaded artifact contains {actual_class_name}"
+            )
+        return True
+
+    @classmethod
+    def _create_and_fit_encoder(cls, data: Any, source_feature: str, encoder_type: str) -> Any:
+        """
+        Create and fit a new encoder.
+
+        Args:
+            data: The input data
+            source_feature: Name of the source feature
+            encoder_type: Type of encoder to create
+
+        Returns:
+            Fitted encoder
+        """
+        # Create encoder instance
+        encoder = cls._create_encoder_instance(encoder_type)
+
+        # Extract training data
+        X_train = cls._extract_training_data(data, source_feature)
+
+        # Reshape data based on encoder type
+        import numpy as np
+
+        if encoder_type == "label":
+            # LabelEncoder expects 1D array
+            if hasattr(X_train, "shape") and len(X_train.shape) > 1:
+                X_train = np.asarray(X_train).flatten()
+        else:
+            # OneHotEncoder and OrdinalEncoder expect 2D array
+            if hasattr(X_train, "shape") and len(X_train.shape) == 1:
+                X_train = np.asarray(X_train).reshape(-1, 1)
+
+        # Fit the encoder
+        encoder.fit(X_train)
+
+        return encoder
+
+    @classmethod
+    @abstractmethod
+    def _extract_training_data(cls, data: Any, source_feature: str) -> Any:
+        """
+        Extract training data for the specified feature.
+
+        Args:
+            data: The input data
+            source_feature: Name of the source feature
+
+        Returns:
+            Training data for the feature
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def _apply_encoder(cls, data: Any, source_feature: str, fitted_encoder: Any) -> Any:
+        """
+        Apply the fitted encoder to the data.
+
+        Args:
+            data: The input data
+            source_feature: Name of the source feature
+            fitted_encoder: The fitted encoder
+
+        Returns:
+            Encoded data
+        """
+        ...

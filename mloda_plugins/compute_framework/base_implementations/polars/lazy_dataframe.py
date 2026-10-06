@@ -1,0 +1,132 @@
+from collections.abc import Sequence
+from typing import Any
+from mloda.core.abstract_plugins.components.data_types import DataType
+from mloda.core.abstract_plugins.hook_context import OutputSchema
+from mloda.user import FeatureName
+from mloda_plugins.compute_framework.base_implementations.polars.dataframe import PolarsDataFrame
+from mloda.provider import BaseMergeEngine, BaseMaskEngine
+from mloda_plugins.compute_framework.base_implementations.polars.polars_lazy_merge_engine import PolarsLazyMergeEngine
+from mloda_plugins.compute_framework.base_implementations.polars.polars_expr_mask_engine import (
+    PolarsExprMaskEngine,
+)
+
+try:
+    import polars as pl
+except ImportError:
+    pl = None  # type: ignore[assignment]
+
+
+class PolarsLazyDataFrame(PolarsDataFrame):
+    """
+    Lazy evaluation version of PolarsDataFrame using pl.LazyFrame.
+
+    This compute framework defers execution of operations until results are explicitly
+    requested, enabling query optimization and reduced memory usage for large datasets.
+    """
+
+    @classmethod
+    def expected_data_framework(cls) -> Any:
+        return cls.pl_lazy_frame()
+
+    @classmethod
+    def merge_engine(cls) -> type[BaseMergeEngine]:
+        return PolarsLazyMergeEngine
+
+    @classmethod
+    def mask_engine(cls) -> type[BaseMaskEngine]:
+        return PolarsExprMaskEngine
+
+    def select_data_by_column_names(
+        self,
+        data: Any,
+        selected_feature_names: Sequence[FeatureName],
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
+    ) -> Any:
+        column_names = set(data.collect_schema().names())
+        _selected_feature_names = self.identify_naming_convention(
+            selected_feature_names, column_names, ordering=column_ordering, request_feature_order=request_feature_order
+        )
+        # Select the columns and collect the lazy evaluation since this is the final result step
+        lazy_result = data.select(list(_selected_feature_names))
+        return lazy_result.collect()
+
+    @classmethod
+    def extract_column_names(cls, data: Any) -> set[str]:
+        return set(data.collect_schema().names())
+
+    def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
+        schema = data.collect_schema()
+        if column_name in schema.names():
+            return str(schema[column_name])
+        return None
+
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+        schema = data.collect_schema()
+        if column_name not in schema.names():
+            return None
+        return PolarsDataFrame._polars_type_to_data_type(schema[column_name])
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Read collect_schema() once and build the sorted (name, dtype) pairs from it directly.
+
+        The dict interchange shape reaches this method before transform() normalizes it, so it
+        must be handled before collect_schema() is called.
+        """
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        schema = data.collect_schema()
+        if not schema:
+            return None
+        return tuple((name, str(dtype)) for name, dtype in sorted(schema.items(), key=lambda pair: pair[0]))
+
+    @classmethod
+    def pl_lazy_frame(cls) -> Any:
+        if pl is None:
+            raise ImportError("Polars is not installed. To be able to use this framework, please install polars.")
+        return pl.LazyFrame
+
+    @classmethod
+    def pl_dataframe(cls) -> Any:
+        if pl is None:
+            raise ImportError("Polars is not installed. To be able to use this framework, please install polars.")
+        return pl.DataFrame
+
+    @classmethod
+    def pl_series(cls) -> Any:
+        if pl is None:
+            raise ImportError("Polars is not installed. To be able to use this framework, please install polars.")
+        return pl.Series
+
+    def transform(
+        self,
+        data: Any,
+        feature_names: Sequence[str],
+    ) -> Any:
+        transformed_data = self.apply_compute_framework_transformer(data)
+        if transformed_data is not None:
+            return transformed_data
+
+        if isinstance(data, dict):
+            """Initial data: Transform dict to lazy frame"""
+            return self.pl_lazy_frame()(data)
+
+        if isinstance(data, self.pl_series()):
+            """Added data: Add column to lazy frame"""
+            if len(feature_names) == 1:
+                feature_name = next(iter(feature_names))
+
+                # Check if feature already exists by examining schema
+                existing_columns = set(self.data.collect_schema().names())
+                if feature_name in existing_columns:
+                    raise ValueError(f"Feature {feature_name} already exists in the dataframe")
+
+                # In Polars lazy mode, we use with_columns to add new columns
+                return self.data.with_columns(data.alias(feature_name))
+            raise ValueError(f"Only one feature can be added at a time: {feature_names}")
+
+        # Handle DataFrame to LazyFrame conversion
+        if isinstance(data, self.pl_dataframe()):
+            return data.lazy()
+
+        raise ValueError(f"Data {type(data)} is not supported by {self.__class__.__name__}")

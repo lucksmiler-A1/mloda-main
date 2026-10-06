@@ -1,0 +1,132 @@
+# Feature Group Versioning
+
+`FeatureGroup.version()` returns an identifier that changes when the code a feature group can run changes. Extenders receive it as `HookContext.feature_group_version`, so lineage, audit and tracing records can tell two implementations apart.
+
+## The version string
+
+The version has three parts, joined by `-`:
+
+- the installed mloda version,
+- the module that defines the feature group,
+- a SHA-256 hash of the feature group's implementation.
+
+## What the implementation hash covers
+
+- **Roots**: the feature group class and every base class in its MRO that is first-party. First-party means the feature group's own top-level package or the `mloda.*` plugin namespace, except mloda's own `mloda.core`, `mloda.user`, `mloda.provider` and `mloda.steward`. The version prefix covers mloda itself.
+- **Reachable code**: every function, class and module-level constant the roots reference by name or by `module.attr`, followed through first-party code. This includes helpers in other modules and constants imported with `from ... import`. A module used as a value, for example in `getattr(helpers, name)`, counts as a whole.
+- **Dotted references into submodules**, such as `pkg.sub.f`: followed from `pkg/sub.py` without importing it, also through namespace subdirectories, so the hash is the same whether or not `pkg.sub` was already imported.
+- **Imports inside a function body**, for example to avoid a circular import: first-party targets are followed from their source files, without importing them, so the hash is the same whether or not the target module was already imported. Third-party and stdlib imports inside a function body add nothing, not even a dependency version.
+- **Canonical form**: each definition is hashed from its syntax tree. Code, constants, decorators, base classes and type annotations count. Docstrings, comments, blank lines and formatting do not. Functions the feature group never references do not count either. The hash is the same on every supported Python version.
+
+```python
+from typing import Any
+
+from mloda.provider import FeatureGroup, FeatureSet
+
+LIMIT = 10
+
+
+def clip(value: int) -> int:
+    return min(value, LIMIT)
+
+
+class ClippedValue(FeatureGroup):
+    """Editing this docstring leaves the version unchanged."""
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return clip(data)
+```
+
+Changing `LIMIT` or the body of `clip` changes `ClippedValue.version()`, even if `clip` lives in another module of the same package.
+
+## Third-party dependencies
+
+The code of third-party packages is never hashed. By default, `ThirdPartyVersionMode.INCLUDE` adds the name and version of every third-party package the reachable code references, so upgrading pandas changes the version of every feature group that uses pandas. A package's version comes from its distribution metadata or its `__version__`. A package with neither is recorded by name only. To leave dependency versions out, override `version_third_party_mode()`. A shared base class sets it for all its subclasses:
+
+```python
+from mloda.provider import FeatureGroup, ThirdPartyVersionMode
+
+
+class DependencyAgnostic(FeatureGroup):
+    @classmethod
+    def version_third_party_mode(cls) -> ThirdPartyVersionMode:
+        return ThirdPartyVersionMode.EXCLUDE
+```
+
+## What the hash does not cover
+
+- mloda itself, beyond the version prefix. Edits to an editable mloda install do not change it.
+- Code reached only through runtime values:
+    - registries filled elsewhere (`REGISTRY["k"] = f`, `REGISTRY.update(...)`),
+    - classes discovered by reflection, such as the file readers `ReadFileFeature` finds through `__subclasses__()` (see below),
+    - imports by a computed name (`importlib.import_module(name)`),
+    - attributes assigned outside the class body,
+    - `getattr` on objects that are not modules,
+    - names captured from an enclosing function.
+- Modules without Python source (C extensions, bytecode-only installs). Their definitions are recorded by name only.
+- Names served by a module-level `__getattr__` (except submodules with a source file), and constants in modules without a source file (for example notebook cells). These are not recorded at all.
+- Data and configuration files the code reads.
+- Source edited after import in a long-lived process. The hash reads the source files the first time it runs for a class, then caches the result for that class object.
+
+Imports are never executed to close these gaps: `version()` runs during computation, and importing a module can register new feature groups or readers mid-run.
+
+### Code reached by reflection
+
+To make such code count, reference it in the class body. Any class attribute works, the name carries no meaning:
+
+```python
+from typing import Any
+
+from mloda.provider import FeatureGroup, FeatureSet
+
+
+class Scaler:
+    def apply(self, value: int) -> int:
+        return value * 2
+
+
+class ScaledValue(FeatureGroup):
+    VERSION_INCLUDES = (Scaler,)
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return data
+```
+
+Editing `Scaler.apply` now changes `ScaledValue.version()`. A third-party class referenced this way records only its package name and version, and nothing under `ThirdPartyVersionMode.EXCLUDE`. `ReadFileFeature` and `ReadDocumentFeature` declare nothing: the readers they find depend on what is imported at runtime, which would make the version depend on import order. The readers shipped with mloda are covered by the version prefix. To version a custom reader, subclass the reader feature group and reference the reader in it.
+
+## When it is computed
+
+`version()` runs for every hook call while an extender is active, and in `get_feature_group_docs()`. The hash is computed once per class and cached for the lifetime of the class object. Each imported module is parsed once per process (a module found only through a function-local import, once per hash), and only the definitions the walk reaches are hashed.
+
+## Custom versioning
+
+Override `FeatureGroup.version()`:
+
+```python
+from mloda.provider import FeatureGroup
+
+
+class PinnedVersion(FeatureGroup):
+    @classmethod
+    def version(cls) -> str:
+        return "1.0.0"
+```
+
+`BaseFeatureGroupVersion` provides the building blocks `mloda_version()`, `module_name()` and `implementation_hash()`. Subclassing it alone changes nothing, because `FeatureGroup.version()` calls `BaseFeatureGroupVersion.version(cls)` directly.
+
+## Reading the mloda Package Version
+
+Three supported programmatic paths, all backed by `mloda.core.version.get_mloda_version()`:
+
+```python
+from mloda.user import __version__          # also on mloda.provider and mloda.steward
+from mloda.core.version import get_mloda_version
+from mloda.provider import BaseFeatureGroupVersion
+
+get_mloda_version()                          # memoized, "0.0.0" if not installed
+BaseFeatureGroupVersion.mloda_version()      # same value
+```
+
+There is no `mloda.__version__`: `mloda` is a PEP 420 namespace root with no `__init__.py`, so plugin packages can add subpackages under it.

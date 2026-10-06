@@ -1,0 +1,396 @@
+"""Tests for the resolution failure messages raised when a feature does not resolve to exactly one group.
+
+The formatting lives in mloda/core/prepare/resolution_failure_renderer.py: _render_multiple names each
+candidate as "ClassName (module.path)" instead of a raw dict/class representation.
+"""
+
+from typing import ClassVar
+
+import pytest
+
+from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import (
+    FeatureChainParserMixin,
+)
+from mloda.core.abstract_plugins.components.property_spec import property_spec
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
+from tests.helpers.plugin_stubs import StubFeatureGroup
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
+
+
+class MockComputeFramework(ComputeFramework):
+    """Mock compute framework for testing."""
+
+    pass
+
+
+class ConflictingFeatureGroupA(StubFeatureGroup):
+    """One of two rivals for the same feature name, so resolution has to report a conflict."""
+
+    DOMAIN_NAME: ClassVar[str] = "domain_a"
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"conflicting_test_feature"})
+
+
+class ConflictingFeatureGroupB(StubFeatureGroup):
+    """The other rival, so the failure message has two candidates to render."""
+
+    DOMAIN_NAME: ClassVar[str] = "domain_b"
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"conflicting_test_feature"})
+
+
+class TestIdentifyFeatureGroupErrorMessageFormat:
+    """Tests for the error message format when multiple feature groups are found."""
+
+    @pytest.mark.parametrize(
+        "expected_fragment",
+        [
+            pytest.param("  - ConflictingFeatureGroupA", id="formatted_class_name"),
+            pytest.param("(tests.test_core.test_prepare.test_identify_feature_group_error_message)", id="module_path"),
+            pytest.param("'conflicting_test_feature'", id="feature_name"),
+        ],
+    )
+    def test_error_message_contains(self, expected_fragment: str) -> None:
+        feature = Feature("conflicting_test_feature")
+
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            ConflictingFeatureGroupA: {MockComputeFramework},
+            ConflictingFeatureGroupB: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        error_message = str(exc_info.value)
+
+        assert expected_fragment in error_message, (
+            f"Error message should contain '{expected_fragment}', but got: {error_message}"
+        )
+
+    def test_error_message_contains_domain_info(self) -> None:
+        """Test that the error message contains domain information.
+
+        Expected format includes domain like:
+          - ClassName (module.path) [domain: domain_a]
+        """
+        feature = Feature("conflicting_test_feature")
+
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            ConflictingFeatureGroupA: {MockComputeFramework},
+            ConflictingFeatureGroupB: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        error_message = str(exc_info.value)
+
+        assert "[domain: domain_a]" in error_message, (
+            f"Error message should contain '[domain: domain_a]', but got: {error_message}"
+        )
+        assert "[domain: domain_b]" in error_message, (
+            f"Error message should contain '[domain: domain_b]', but got: {error_message}"
+        )
+
+    def test_error_message_does_not_contain_raw_dict_representation(self) -> None:
+        """Test that the error message does NOT contain raw dict/class representation.
+
+        The old format looks like:
+            Multiple feature groups {<class '...'>: {<class '...'>}} found for feature name: ...
+
+        This raw representation should NOT appear in the new format.
+        """
+        feature = Feature("conflicting_test_feature")
+
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            ConflictingFeatureGroupA: {MockComputeFramework},
+            ConflictingFeatureGroupB: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        error_message = str(exc_info.value)
+
+        assert "{<class" not in error_message, (
+            f"Error message should NOT contain raw class representation '{{<class', but got: {error_message}"
+        )
+
+
+class KnownFeatureGroup(StubFeatureGroup):
+    """Feature group that matches 'known_feature' for testing fuzzy match suggestions."""
+
+    # Matching stays narrower than the supported names: 'another_feature' is only a suggestion source.
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"known_feature"})
+    SUPPORTED_NAMES: ClassVar[frozenset[str]] = frozenset({"known_feature", "another_feature"})
+
+
+class TestNoFeatureGroupFoundErrorMessage:
+    """Tests for the improved 'no feature groups found' error message."""
+
+    def test_suggests_similar_feature_names(self) -> None:
+        feature = Feature("knwon_feature")  # typo of "known_feature"
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            KnownFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError, match="Did you mean") as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+            )
+
+        error_message = str(exc_info.value)
+        assert "known_feature" in error_message
+
+    def test_includes_troubleshooting_link(self) -> None:
+        feature = Feature("nonexistent_xyz")
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            KnownFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError, match="troubleshooting"):
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+            )
+
+    def test_suggests_resolve_feature(self) -> None:
+        feature = Feature("nonexistent_xyz")
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            KnownFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError, match="resolve_feature"):
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+            )
+
+    def test_no_similar_names_still_shows_help(self) -> None:
+        feature = Feature("zzz_completely_different")
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            KnownFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+            )
+
+        error_message = str(exc_info.value)
+        assert "resolve_feature" in error_message
+        assert "Did you mean" not in error_message
+
+
+class TestScopedResolveFeaturePointerWording:
+    """The no-match debug pointer names feature_group exactly when the feature is scoped (issue #693)."""
+
+    def test_scoped_no_match_pointer_includes_feature_group(self) -> None:
+        """A scoped no-match error points at the scoped resolve_feature form."""
+        feature = Feature("nonexistent_xyz", feature_group="KnownFeatureGroup")
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            KnownFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Scoped to feature group: 'KnownFeatureGroup'." in error_message
+        assert "resolve_feature(name, options=..., feature_group=...)" in error_message, (
+            f"Scoped no-match errors must point at resolve_feature(name, options=..., feature_group=...), "
+            f"but got: {error_message}"
+        )
+
+    def test_unscoped_no_match_pointer_stays_unscoped(self) -> None:
+        """An unscoped no-match error keeps the plain resolve_feature pointer without feature_group."""
+        feature = Feature("nonexistent_xyz")
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            KnownFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+            )
+
+        error_message = str(exc_info.value)
+        assert "resolve_feature(name, options=...)" in error_message
+        assert "feature_group=..." not in error_message
+
+
+class StrictWindowFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+    """Config-based feature group with a strict, validated 'window_size' property.
+
+    Deliberately does NOT override match_feature_group_criteria, so it exercises the
+    mixin's default swallow-to-False path: an element_validator rejection inside
+    FeatureChainParser._validate_property_value raises ValueError, which
+    match_feature_group_criteria catches and turns into a plain False. The match pass
+    records that rejection as it happens, and the failure message renders the recorded
+    reason.
+    """
+
+    PROPERTY_MAPPING = {
+        "window_size": property_spec(
+            "Size of window",
+            strict=True,
+            context=False,
+            element_validator=lambda v: isinstance(v, int) and 0 < v <= 13,
+        ),
+        DefaultOptionKeys.in_features: property_spec("source", context=True),
+    }
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return None
+
+
+class StrictMaxWindowFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+    """Second strict-rejecting config-based feature group, mapping a different key
+    ('max_window') than StrictWindowFeatureGroup, used to verify the hint names
+    every rejecting candidate rather than only the first.
+    """
+
+    PROPERTY_MAPPING = {
+        "max_window": property_spec(
+            "Maximum window size",
+            strict=True,
+            context=False,
+            element_validator=lambda v: isinstance(v, int) and 0 < v <= 13,
+        ),
+        DefaultOptionKeys.in_features: property_spec("source", context=True),
+    }
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return None
+
+
+class TestStrictValidationRejectionHint:
+    """Tests for the strict-validation rejection hint in the no-feature-group error.
+
+    The match pass records each candidate's strict-validation rejection as it happens,
+    and the no-feature-group-found error surfaces the recorded reason (e.g. "Property
+    value int 14 failed validation for 'window_size'") together with the culprit class
+    name(s).
+    """
+
+    def test_hint_names_rejected_option_value_and_class(self) -> None:
+        feature = Feature(
+            "strict_window_test_feature",
+            Options(context={DefaultOptionKeys.in_features: "src", "window_size": 14}),
+        )
+
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            StrictWindowFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        error_message = str(exc_info.value)
+
+        assert "window_size" in error_message, (
+            f"Error message should name the rejected option 'window_size', but got: {error_message}"
+        )
+        assert "14" in error_message, f"Error message should include the rejected value '14', but got: {error_message}"
+        assert "StrictWindowFeatureGroup" in error_message, (
+            f"Error message should name the culprit feature group, but got: {error_message}"
+        )
+
+    def test_no_hint_when_feature_is_unrelated(self) -> None:
+        """A feature with none of the mapped keys present is a non-match, not a
+        rejection: match_feature_group_criteria returns False without raising, so
+        no rejection is recorded and there is nothing to surface."""
+        feature = Feature("totally_unrelated_feature")
+
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            StrictWindowFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        error_message = str(exc_info.value)
+
+        assert "StrictWindowFeatureGroup" not in error_message, (
+            f"Error message should NOT name a feature group for an unrelated feature, but got: {error_message}"
+        )
+        assert "window_size" not in error_message, (
+            f"Error message should NOT mention 'window_size' for an unrelated feature, but got: {error_message}"
+        )
+
+    def test_hint_names_all_rejecting_classes(self) -> None:
+        """When multiple accessible candidates each reject the same feature via strict
+        validation, the hint must name every one of them, not just the first."""
+        feature = Feature(
+            "strict_multi_test_feature",
+            Options(
+                context={
+                    DefaultOptionKeys.in_features: "src",
+                    "window_size": 14,
+                    "max_window": 20,
+                }
+            ),
+        )
+
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            StrictWindowFeatureGroup: {MockComputeFramework},
+            StrictMaxWindowFeatureGroup: {MockComputeFramework},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            evaluate_or_raise(
+                feature=feature,
+                accessible_plugins=accessible_plugins,
+                links=None,
+                data_access_collection=None,
+            )
+
+        error_message = str(exc_info.value)
+
+        assert "StrictWindowFeatureGroup" in error_message, (
+            f"Error message should name StrictWindowFeatureGroup, but got: {error_message}"
+        )
+        assert "StrictMaxWindowFeatureGroup" in error_message, (
+            f"Error message should name StrictMaxWindowFeatureGroup, but got: {error_message}"
+        )

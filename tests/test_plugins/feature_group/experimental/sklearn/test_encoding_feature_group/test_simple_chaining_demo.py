@@ -1,0 +1,62 @@
+"""
+Simple demonstration of encoding + scaling chaining.
+"""
+
+import pytest
+from typing import Any
+
+from mloda.user import PluginLoader
+from mloda.user import Feature
+from mloda.user import PluginCollector
+from mloda.user import mloda
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.feature_group.experimental.sklearn.encoding.pandas import PandasEncodingFeatureGroup
+from mloda_plugins.feature_group.experimental.sklearn.scaling.pandas import PandasScalingFeatureGroup
+from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
+
+
+class SimpleChainTestDataCreator(ATestDataCreator):
+    """Test data creator for simple chaining tests."""
+
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        """Return the raw data as a dictionary."""
+        return {
+            "customer_id": [1, 2, 3, 4, 5],
+            "category": ["Premium", "Standard", "Basic", "Premium", "Standard"],
+            "sales": [1000, 500, 250, 1200, 600],
+        }
+
+
+class TestSimpleChaining:
+    """Simple chaining test to understand the issue."""
+
+    def test_step_by_step_chaining(self) -> None:
+        """Test chaining step by step to understand the issue."""
+        # Skip test if sklearn not available
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        PluginLoader().all()
+
+        # Enable the necessary feature groups
+        plugin_collector = PluginCollector.enabled_feature_groups(
+            {SimpleChainTestDataCreator, PandasEncodingFeatureGroup, PandasScalingFeatureGroup}
+        )
+
+        # Step 1: Create OneHot encoding first
+        print("Step 1: Creating OneHot encoding...")
+        # L→R: category__onehot_encoded~0__standard_scaled
+        onehot_feature = Feature("category__onehot_encoded~0__standard_scaled")
+        api1 = mloda([onehot_feature], [PandasDataFrame], plugin_collector=plugin_collector)
+        results1 = api1.run()
+        df1 = results1[0]
+
+        print("Columns after OneHot encoding:")
+        print(list(df1.columns))
+        print("Data:")
+        print(df1)

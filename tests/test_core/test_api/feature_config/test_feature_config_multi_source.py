@@ -1,0 +1,143 @@
+"""
+Unit tests for multi-source feature configuration.
+
+This module tests the in_features field which allows features to specify
+multiple source features (e.g., distance calculations requiring latitude and longitude).
+"""
+
+from mloda.user import Feature
+from mloda.core.api.feature_config.loader import load_features_from_config
+from mloda.core.api.feature_config.models import FeatureConfig
+from mloda.core.api.feature_config.parser import parse_json
+from mloda.provider import DefaultOptionKeys
+
+
+def test_parse_feature_with_multiple_sources() -> None:
+    """Test parsing JSON with in_features array field for multi-source features.
+
+    Features that require multiple input sources (e.g., distance calculation
+    from latitude and longitude) should use the in_features field with an
+    array of source feature names.
+
+    This test verifies that parse_json correctly handles and preserves the
+    in_features array field in FeatureConfig objects.
+
+    Example:
+        {
+            "name": "distance_from_center",
+            "in_features": ["latitude", "longitude"]
+        }
+    """
+    config_str = """[
+        {
+            "name": "distance_from_center",
+            "in_features": ["latitude", "longitude"]
+        },
+        {
+            "name": "area_calculation",
+            "in_features": ["width", "height"],
+            "options": {"unit": "square_meters"}
+        }
+    ]"""
+
+    result = parse_json(config_str)
+
+    assert len(result) == 2
+
+    # First multi-source feature
+    assert isinstance(result[0], FeatureConfig)
+    assert result[0].name == "distance_from_center"
+    assert result[0].in_features == ["latitude", "longitude"]
+    assert result[0].options == {}
+
+    # Second multi-source feature with options
+    assert isinstance(result[1], FeatureConfig)
+    assert result[1].name == "area_calculation"
+    assert result[1].in_features == ["width", "height"]
+    assert result[1].options == {"unit": "square_meters"}
+
+
+def test_load_multiple_sources_as_tuple() -> None:
+    """Test that loader converts in_features array to an ordered tuple in options.
+
+    When a feature config includes in_features array (e.g., ["latitude", "longitude"]),
+    the loader should:
+    1. Convert the array to an ordered tuple (order and duplicates kept)
+    2. Store the tuple in options.context[DefaultOptionKeys.in_features]
+    3. Preserve any other options in the appropriate location
+
+    The tuple ensures:
+    - Immutability (cannot be modified after creation)
+    - Hashability (can be used as dict keys or in sets)
+    - Declared order is preserved
+
+    Example:
+        Input: {"name": "distance", "in_features": ["lat", "lon"]}
+        Output: Feature.options.context[in_features] = ("lat", "lon")
+    """
+    config_str = """[
+        {
+            "name": "distance_from_center",
+            "in_features": ["latitude", "longitude"],
+            "options": {"method": "haversine"}
+        },
+        {
+            "name": "area_calculation",
+            "in_features": ["width", "height"],
+            "group_options": {"unit": "square_meters"},
+            "context_options": {"precision": "high"}
+        }
+    ]"""
+
+    result = load_features_from_config(config_str)
+
+    assert len(result) == 2
+
+    # First feature: in_features with simple options
+    assert isinstance(result[0], Feature)
+    assert result[0].name == "distance_from_center"
+
+    # in_features should be converted to tuple and stored in context
+    # Note: Using DefaultOptionKeys.in_features (singular)
+    in_features = result[0].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features, tuple)
+    assert in_features == ("latitude", "longitude")
+
+    # Regular options should be in group
+    assert result[0].options.group.get("method") == "haversine"
+
+    # Second feature: in_features with group_options and context_options
+    assert isinstance(result[1], Feature)
+    assert result[1].name == "area_calculation"
+
+    # in_features should be converted to tuple and stored in context
+    in_features_2 = result[1].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features_2, tuple)
+    assert in_features_2 == ("width", "height")
+
+    # Group options should be in group
+    assert result[1].options.group.get("unit") == "square_meters"
+
+    # Context options should be merged into context (along with in_features)
+    assert result[1].options.context.get("precision") == "high"
+
+
+def test_single_source_uses_list() -> None:
+    """Test that single sources should use in_features with a single-item list.
+
+    Even for features with a single source, we now use in_features
+    with a single-item list for consistency:
+
+    Example:
+        {
+            "name": "scaled_age",
+            "in_features": ["age"]  # Single source in a list
+        }
+    """
+    # Test case: single source in in_features list
+    config_single = FeatureConfig(name="single_source", in_features=["age"])
+    assert config_single.in_features == ["age"]
+
+    # Verify that using multiple in_features works fine
+    config_multi = FeatureConfig(name="multi_source", in_features=["latitude", "longitude"])
+    assert config_multi.in_features == ["latitude", "longitude"]

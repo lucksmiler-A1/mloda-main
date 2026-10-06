@@ -1,0 +1,88 @@
+from copy import copy
+from typing import Any
+import uuid
+
+
+from mloda.core.filter.filter_type_enum import FilterType
+from mloda.core.filter.filter_parameter import FilterParameterImpl
+
+
+class SingleFilter:
+    """
+    Represents a single filter with a feature, filter type, and parameters.
+    """
+
+    def __init__(
+        self,
+        filter_feature: str | Any,  # Union[str, Feature]
+        filter_type: str | FilterType,
+        parameter: dict[str, Any],
+    ) -> None:
+        """
+        Initialize a SingleFilter instance.
+
+        :param filter_feature: The feature to which the filter applies.
+        :param filter_type: The type of filter (e.g., 'range', 'zscore', etc.).
+        :param parameter: A dictionary of parameters required by the filter.
+        """
+        self.filter_feature = self.handle_filter_feature(filter_feature)
+        self.filter_type = self.handle_filter_type(filter_type)
+        self.parameter = self.handle_parameter(parameter)
+
+        self.uuid = uuid.uuid4()
+
+    @property
+    def name(self) -> str:
+        """Read-through to the filter feature so a later rename stays visible."""
+        return str(self.filter_feature.name)
+
+    def handle_filter_type(self, filter_type: str | FilterType) -> str:
+        if not filter_type:
+            raise ValueError(f"Filter type evaluates to false {filter_type}.")
+
+        if isinstance(filter_type, FilterType):
+            return filter_type.value
+        elif isinstance(filter_type, str):
+            return filter_type
+
+        raise ValueError(f"Wrong type of Filter. {filter_type}")
+
+    def handle_filter_feature(self, filter_feature: str | Any) -> Any:  # Union[str, Feature]
+        from mloda.core.abstract_plugins.components.feature import Feature
+
+        if isinstance(filter_feature, Feature):
+            # The caller keeps its own object: Feature.__copy__ owns the containers that decide the
+            # hash, so a later write to them cannot lose this filter from a set it sits in (#910).
+            return copy(filter_feature)
+        elif isinstance(filter_feature, str):
+            return Feature(name=filter_feature)
+        else:
+            raise ValueError(f"filter_feature is of wrong type {filter_feature}")
+
+    def handle_parameter(self, parameter: dict[str, Any]) -> FilterParameterImpl:
+        if not isinstance(parameter, dict):
+            raise ValueError(f"Filter parameter is not a dictionary: {parameter}.")
+
+        elif not parameter:
+            raise ValueError(f"Dictionary is empty: {parameter}.")
+
+        return FilterParameterImpl.from_dict(parameter)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SingleFilter):
+            return False
+        # Feature excludes feature_group_scope from its own identity, but the scope decides
+        # filter attachment, so the DECLARATION identity must include it.
+        return (
+            self.filter_feature == other.filter_feature
+            and self.filter_type == other.filter_type
+            and self.parameter == other.parameter
+            and self.filter_feature.feature_group_scope == other.filter_feature.feature_group_scope
+        )
+
+    def __hash__(self) -> int:
+        # Combine the hashes of the feature, type, and parameter for a unique hash value
+        return hash((self.filter_feature, self.filter_type, self.parameter, self.filter_feature.feature_group_scope))
+
+    def __repr__(self) -> str:
+        return f"<SingleFilter(feature_name={self.filter_feature.name}, type={self.filter_type}, parameters={self.parameter})>"

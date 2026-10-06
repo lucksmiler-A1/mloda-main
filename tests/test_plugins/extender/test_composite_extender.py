@@ -1,0 +1,1136 @@
+"""Tests for composite extender functionality allowing multiple Extenders.
+
+This module tests the ability to have multiple Extender instances
+wrapping the same function type, with priority-based execution order and error resilience.
+"""
+
+from typing import Any, Callable
+from unittest.mock import Mock
+import pytest
+import logging
+
+from mloda.core.abstract_plugins.function_extender import (
+    ExtenderHook,
+    Extender,
+)
+from mloda.core.abstract_plugins.function_extender import CompositeExtender
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.provider import ComputeFramework
+
+
+class DummyExtender(Extender):
+    """Minimal concrete Extender used to exercise the base class's priority property."""
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+class MockExtender(Extender):
+    """Mock extender for testing purposes.
+
+    ``raise_on_error`` mirrors the new error contract: when True (default) an
+    extender failure must break the calculation; when False the extender opts
+    into warning-only behavior (log + fall back to the wrapped function).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        priority: int = 100,
+        should_fail: bool = False,
+        raise_on_error: bool = True,
+        never_fall_back: bool = False,
+    ):
+        self.name = name
+        self.priority = priority
+        self.should_fail = should_fail
+        # Uses the base-class property/setter (same pattern as ``priority``)
+        # so the mock reports its opt-in via ``raise_on_error``.
+        self.raise_on_error = raise_on_error
+        self.never_fall_back = never_fall_back
+        self.call_count = 0
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        self.call_count += 1
+        if self.should_fail:
+            raise ValueError(f"MockExtender {self.name} intentionally failed")
+        result = func(*args, **kwargs)
+        return result
+
+
+class _PostFailExtender(Extender):
+    """Warning-only extender that delegates successfully, then fails in its OWN post-processing.
+
+    ``__call__`` runs the wrapped function first (so the inner result is already
+    computed) and only afterwards raises. The correct fallback must return the
+    already-computed inner result WITHOUT re-running the wrapped function.
+    """
+
+    def __init__(self, name: str, priority: int = 100, never_fall_back: bool = False) -> None:
+        self.name = name
+        self.priority = priority
+        self.raise_on_error = False
+        self.never_fall_back = never_fall_back
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        func(*args, **kwargs)
+        raise ValueError("post boom")
+
+
+class TestExtenderPriority:
+    """Test that Extender has a priority property."""
+
+    def test_priority_property_exists_on_base_class(self) -> None:
+        """Test that Extender base class defines priority."""
+        # A concrete Extender implementation should have priority via the base class
+
+        dummy = DummyExtender()
+        assert hasattr(dummy, "priority"), "Extender implementations must have a priority property"
+
+    def test_priority_default_value(self) -> None:
+        """Test that priority defaults to 100 when not specified."""
+        dummy = DummyExtender()
+        assert dummy.priority == 100, "Default priority should be 100"
+
+    def test_priority_custom_value(self) -> None:
+        """Test that priority can be set to a custom value."""
+
+        # This will fail until priority can be customized in __init__
+        class CustomPriorityExtender(Extender):
+            def __init__(self, priority: int = 100):
+                self.priority = priority
+
+            def wraps(self) -> set[ExtenderHook]:
+                return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+            def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+                return func(*args, **kwargs)
+
+        extender = CustomPriorityExtender(priority=50)
+        assert extender.priority == 50, "Priority should be settable to custom value"
+
+
+class TestCompositeExtender:
+    """Test CompositeExtender class that chains multiple extenders."""
+
+    def test_composite_extender_class_exists(self) -> None:
+        """Test that CompositeExtender class is defined."""
+        # This will fail until CompositeExtender is implemented
+        assert CompositeExtender is not None, "CompositeExtender class must exist"
+
+    def test_composite_extender_inherits_from_wrapper(self) -> None:
+        """Test that CompositeExtender inherits from Extender."""
+
+        # This will fail until CompositeExtender inherits properly
+        assert issubclass(CompositeExtender, Extender), "CompositeExtender must inherit from Extender"
+
+    def test_composite_extender_accepts_list_of_extenders(self) -> None:
+        """Test that CompositeExtender can be initialized with a list of extenders."""
+
+        extender1 = MockExtender("first", priority=10)
+        extender2 = MockExtender("second", priority=20)
+
+        # This will fail until CompositeExtender accepts extenders in __init__
+        composite = CompositeExtender([extender1, extender2])
+        assert composite is not None, "CompositeExtender should accept list of extenders"
+
+    def test_composite_extender_chains_multiple_extenders(self) -> None:
+        """Test that CompositeExtender calls all extenders in the chain."""
+
+        extender1 = MockExtender("first", priority=10)
+        extender2 = MockExtender("second", priority=20)
+        composite = CompositeExtender([extender1, extender2])
+
+        def test_func(x: int, y: int) -> int:
+            return x + y
+
+        # This will fail until CompositeExtender calls all extenders
+        result = composite(test_func, 5, 3)
+
+        assert result == 8, "Function should execute correctly"
+        assert extender1.call_count == 1, "First extender should be called"
+        assert extender2.call_count == 1, "Second extender should be called"
+
+    def test_composite_extender_wraps_returns_union(self) -> None:
+        """Test that CompositeExtender.wraps() returns union of all wrapped types."""
+
+        extender1 = MockExtender("first")
+        extender2 = MockExtender("second")
+        composite = CompositeExtender([extender1, extender2])
+
+        # This will fail until CompositeExtender.wraps() returns proper union
+        wrapped = composite.wraps()
+        assert ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE in wrapped, (
+            "CompositeExtender should wrap all function types from child extenders"
+        )
+
+    def test_composite_extender_chain_tampering_is_discarded(self) -> None:
+        tamperer = _TamperingExtender("tamperer", priority=10, tampered="tampered-by-first-link")
+        honest = MockExtender("honest", priority=20)
+        composite = CompositeExtender([tamperer, honest])
+
+        def test_func(x: int) -> int:
+            return x * 2
+
+        result = composite(test_func, 5)
+
+        assert result == 10, "wrapped-function result must win over a link's tampered value"
+
+
+class TestExtenderExecutionOrder:
+    """Test that extenders execute in priority order (lower first)."""
+
+    def test_extenders_execute_in_priority_order(self) -> None:
+        """Test that extenders with lower priority execute first."""
+        execution_order = []
+
+        class OrderTrackingExtender(Extender):
+            def __init__(self, name: str, priority: int):
+                self.name = name
+                self.priority = priority
+
+            def wraps(self) -> set[ExtenderHook]:
+                return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+            def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+                execution_order.append(self.name)
+                return func(*args, **kwargs)
+
+        # Create extenders with different priorities (intentionally out of order)
+        extender_high = OrderTrackingExtender("high_priority_50", priority=50)
+        extender_low = OrderTrackingExtender("low_priority_10", priority=10)
+        extender_mid = OrderTrackingExtender("mid_priority_30", priority=30)
+
+        # This will fail until CompositeExtender sorts by priority
+        composite = CompositeExtender([extender_high, extender_low, extender_mid])
+
+        def test_func() -> str:
+            return "done"
+
+        composite(test_func)
+
+        # Should execute in order: low (10), mid (30), high (50)
+        assert execution_order == ["low_priority_10", "mid_priority_30", "high_priority_50"], (
+            "Extenders should execute in priority order (lower priority value first)"
+        )
+
+
+class TestExtenderErrorResilience:
+    """Test that if one extender fails, the chain continues."""
+
+    def test_continues_after_extender_failure(self) -> None:
+        """A WARNING-ONLY extender that fails must not break the chain.
+
+        Under the new contract, only extenders that opt out of breaking
+        (``raise_on_error=False``) fall back; the rest of the chain and the
+        wrapped function still execute.
+        """
+
+        extender1 = MockExtender("first", priority=10)
+        extender2 = MockExtender("failing", priority=20, should_fail=True, raise_on_error=False)
+        extender3 = MockExtender("third", priority=30)
+
+        composite = CompositeExtender([extender1, extender2, extender3])
+
+        def test_func(x: int) -> int:
+            return x * 2
+
+        result = composite(test_func, 5)
+
+        assert result == 10, "Function should still execute despite middle warning-only extender failure"
+        assert extender1.call_count == 1, "First extender should execute"
+        assert extender2.call_count == 1, "Failing extender should be attempted"
+        assert extender3.call_count == 1, "Third extender should execute despite failure"
+
+    def test_logs_error_when_extender_fails(self, caplog: Any) -> None:
+        """A warning-only extender failure is logged at WARNING level."""
+
+        extender1 = MockExtender("first", priority=10)
+        extender2 = MockExtender("failing", priority=20, should_fail=True, raise_on_error=False)
+
+        composite = CompositeExtender([extender1, extender2])
+
+        def test_func(x: int) -> int:
+            return x * 2
+
+        with caplog.at_level(logging.WARNING):
+            composite(test_func, 5)
+
+        assert any(
+            record.levelno == logging.WARNING and "MockExtender failing intentionally failed" in record.message
+            for record in caplog.records
+        ), "Warning-only extender failures should be logged at WARNING level and identify the failure"
+
+    def test_original_function_error_propagates(self) -> None:
+        """Test that errors from the original function are not caught."""
+
+        extender = MockExtender("test", priority=10)
+        composite = CompositeExtender([extender])
+
+        def failing_func() -> None:
+            raise RuntimeError("Original function error")
+
+        # This will fail until error handling only catches extender errors, not function errors
+        with pytest.raises(RuntimeError, match="Original function error"):
+            composite(failing_func)
+
+
+class TestGetFunctionExtenderWithComposite:
+    """Test that get_function_extender returns CompositeExtender for multiple matches."""
+
+    def test_get_function_extender_returns_composite_for_multiple_matches(self) -> None:
+        """Test that get_function_extender returns a CompositeExtender when multiple extenders match."""
+
+        # Create a mock ComputeFramework with multiple extenders
+        extender1 = MockExtender("first", priority=10)
+        extender2 = MockExtender("second", priority=20)
+
+        # This will fail until get_function_extender supports multiple extenders
+        # Currently it raises ValueError for multiple matches
+        compute_fw = Mock(spec=ComputeFramework)
+        compute_fw._hook_extenders = None
+        compute_fw.function_extender = [extender1, extender2]
+        compute_fw.get_function_extender = ComputeFramework.get_function_extender.__get__(compute_fw)
+
+        result = compute_fw.get_function_extender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+
+        assert isinstance(result, CompositeExtender), (
+            "get_function_extender should return CompositeExtender for multiple matches"
+        )
+        assert isinstance(result, Extender), "CompositeExtender should be a Extender"
+
+    def test_get_function_extender_preserves_priority_order(self) -> None:
+        """Test that get_function_extender creates CompositeExtender with correct priority order."""
+
+        # Create extenders in non-priority order
+        extender_high = MockExtender("high", priority=50)
+        extender_low = MockExtender("low", priority=10)
+        extender_mid = MockExtender("mid", priority=30)
+
+        compute_fw = Mock(spec=ComputeFramework)
+        compute_fw._hook_extenders = None
+        compute_fw.function_extender = [extender_high, extender_low, extender_mid]
+        compute_fw.get_function_extender = ComputeFramework.get_function_extender.__get__(compute_fw)
+
+        # This will fail until CompositeExtender sorts extenders by priority
+        result = compute_fw.get_function_extender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+
+        assert isinstance(result, CompositeExtender), "Should return CompositeExtender"
+
+        # Execute and verify order
+        execution_order = []
+
+        def track_order(name: str) -> Callable[..., Any]:
+            def inner(func: Any, *args: Any, **kwargs: Any) -> Any:
+                execution_order.append(name)
+                return func(*args, **kwargs)
+
+            return inner
+
+        # Patch the extender calls to track order
+        extender_low.__call__ = track_order("low")  # type: ignore[method-assign]
+        extender_mid.__call__ = track_order("mid")  # type: ignore[method-assign]
+        extender_high.__call__ = track_order("high")  # type: ignore[method-assign]
+
+        def test_func() -> str:
+            return "done"
+
+        result(test_func)
+
+        assert execution_order == ["low", "mid", "high"], "CompositeExtender should maintain priority order"
+
+    def test_get_function_extender_single_match_unchanged(self) -> None:
+        """Test that get_function_extender returns single extender directly when only one matches."""
+        extender = MockExtender("only", priority=10)
+
+        compute_fw = Mock(spec=ComputeFramework)
+        compute_fw._hook_extenders = None
+        compute_fw.function_extender = [extender]
+        compute_fw.get_function_extender = ComputeFramework.get_function_extender.__get__(compute_fw)
+
+        # This should continue to work as before - single extender returned directly
+        result = compute_fw.get_function_extender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+
+        assert result is extender, "Single matching extender should be returned directly (backward compatibility)"
+
+
+class _WrapsCountingExtender(Extender):
+    """Counts wraps() calls."""
+
+    def __init__(self, priority: int = 100) -> None:
+        self.priority = priority
+        self.wraps_calls = 0
+
+    def wraps(self) -> set[ExtenderHook]:
+        self.wraps_calls += 1
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+class TestRealFrameworkSelectsExtenderOnce:
+    """A real ComputeFramework builds its hook table once and reuses it."""
+
+    def test_repeated_lookups_return_same_object_and_do_not_call_wraps_again(self) -> None:
+        from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import (
+            PythonDictFramework,
+        )
+
+        counting_a = _WrapsCountingExtender(priority=10)
+        counting_b = _WrapsCountingExtender(priority=20)
+        framework = PythonDictFramework(function_extender={counting_a, counting_b})
+        hook = ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE
+
+        first = framework.get_function_extender(hook)
+        calls_after_first = (counting_a.wraps_calls, counting_b.wraps_calls)
+        for _ in range(3):
+            assert framework.get_function_extender(hook) is first
+
+        assert isinstance(first, CompositeExtender)
+        assert (counting_a.wraps_calls, counting_b.wraps_calls) == calls_after_first
+        assert calls_after_first == (1, 1)
+
+
+class TestExtenderRaiseOnErrorProperty:
+    """Test the new ``raise_on_error`` property (mirrors the ``priority`` property)."""
+
+    def test_raise_on_error_default_true(self) -> None:
+        """raise_on_error defaults to True on a plain Extender subclass (breaking by default)."""
+
+        class PlainExtender(Extender):
+            def wraps(self) -> set[ExtenderHook]:
+                return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+            def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+                return func(*args, **kwargs)
+
+        extender = PlainExtender()
+        assert extender.raise_on_error is True, "Extenders must break by default (raise_on_error=True)"
+
+    def test_raise_on_error_settable_to_false(self) -> None:
+        """raise_on_error can be set to False to opt into warning-only behavior."""
+
+        class PlainExtender(Extender):
+            def wraps(self) -> set[ExtenderHook]:
+                return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+            def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+                return func(*args, **kwargs)
+
+        extender = PlainExtender()
+        extender.raise_on_error = False
+        assert extender.raise_on_error is False, "raise_on_error should be settable to False"
+
+    def test_flags_settable_in_init_and_after_construction_before_first_use(self) -> None:
+        in_init = MockExtender("a", priority=5, raise_on_error=False, never_fall_back=True)
+        assert (in_init.priority, in_init.raise_on_error, in_init.never_fall_back) == (5, False, True)
+
+        late = MockExtender("b")
+        late.raise_on_error = False
+        late.priority = 7
+        late.never_fall_back = True
+        assert (late.priority, late.raise_on_error, late.never_fall_back) == (7, False, True)
+
+
+class TestExtenderRaiseOnErrorContractComposite:
+    """Pin the new breaking-by-default error contract for the composite path."""
+
+    def test_default_extender_failure_re_raises(self) -> None:
+        """A DEFAULT (raise_on_error=True) extender that fails must re-raise, not swallow/fall back."""
+
+        failing = MockExtender("boom", priority=10, should_fail=True)  # raise_on_error defaults True
+        composite = CompositeExtender([failing])
+
+        def test_func(x: int) -> int:
+            return x * 2
+
+        with pytest.raises(ValueError, match="MockExtender boom intentionally failed"):
+            composite(test_func, 5)
+
+    def test_default_extender_failure_does_not_call_fallback(self) -> None:
+        """A breaking extender failure must not silently run the wrapped function as a fallback."""
+
+        call_marker = {"func_calls": 0}
+
+        failing = MockExtender("boom", priority=10, should_fail=True)
+        composite = CompositeExtender([failing])
+
+        def test_func(x: int) -> int:
+            call_marker["func_calls"] += 1
+            return x * 2
+
+        with pytest.raises(ValueError, match="MockExtender boom intentionally failed"):
+            composite(test_func, 5)
+
+        assert call_marker["func_calls"] == 0, "Breaking extender must not fall back to the wrapped function"
+
+    def test_adding_extender_does_not_change_error_semantics(self) -> None:
+        """SYMMETRY: a single breaking extender raises; adding a second breaking extender still raises."""
+
+        def test_func(x: int) -> int:
+            return x * 2
+
+        # Single breaking extender
+        single = CompositeExtender([MockExtender("boom", priority=10, should_fail=True)])
+        with pytest.raises(ValueError, match="MockExtender boom intentionally failed"):
+            single(test_func, 5)
+
+        # Adding a second (non-failing) breaking extender must not change the semantics
+        composite = CompositeExtender(
+            [
+                MockExtender("boom", priority=10, should_fail=True),
+                MockExtender("ok", priority=20),
+            ]
+        )
+        with pytest.raises(ValueError, match="MockExtender boom intentionally failed"):
+            composite(test_func, 5)
+
+    def test_warning_only_extender_falls_back_and_warns(self, caplog: Any) -> None:
+        """A warning-only (raise_on_error=False) extender that fails logs a warning and falls back."""
+
+        failing = MockExtender("soft", priority=10, should_fail=True, raise_on_error=False)
+        other = MockExtender("ok", priority=20)
+        composite = CompositeExtender([failing, other])
+
+        def test_func(x: int) -> int:
+            return x * 2
+
+        with caplog.at_level(logging.WARNING):
+            result = composite(test_func, 5)
+
+        assert result == 10, "Warning-only extender failure should fall back to the wrapped function"
+        assert other.call_count == 1, "Remaining extenders should still execute"
+        assert any(
+            record.levelno == logging.WARNING and "MockExtender soft intentionally failed" in record.message
+            for record in caplog.records
+        ), "Warning-only failure should be logged at WARNING level"
+
+
+class _FakeFeatureGroup:
+    """Minimal feature group exercising the single-extender path of run_calculate_feature."""
+
+    def __init__(self) -> None:
+        self.calc_count = 0
+
+    def calculate_feature(self, data: Any, features: Any) -> Any:
+        self.calc_count += 1
+        return f"calculated:{data}"
+
+    def get_class_name(self) -> str:
+        return "FakeFeatureGroup"
+
+
+class _KeyErrorFeatureGroup:
+    """Feature group whose calculate_feature raises KeyError, counting invocations."""
+
+    def __init__(self) -> None:
+        self.calc_count = 0
+
+    def calculate_feature(self, data: Any, features: Any) -> Any:
+        self.calc_count += 1
+        raise KeyError("missing_col")
+
+    def get_class_name(self) -> str:
+        return "KeyErrorFeatureGroup"
+
+
+class _RuntimeErrorFeatureGroup:
+    """Feature group whose calculate_feature raises RuntimeError, counting invocations."""
+
+    def __init__(self) -> None:
+        self.calc_count = 0
+
+    def calculate_feature(self, data: Any, features: Any) -> Any:
+        self.calc_count += 1
+        raise RuntimeError("inner boom")
+
+    def get_class_name(self) -> str:
+        return "RuntimeErrorFeatureGroup"
+
+
+class TestWarningOnlyDoesNotSwallowInnerErrors:
+    """Pin that a warning-only extender only handles its OWN failures.
+
+    Exceptions raised by the inner function or a downstream breaking extender must
+    propagate unchanged, and the inner function must never be executed twice.
+    """
+
+    def test_warning_only_outer_does_not_swallow_breaking_inner(self, caplog: Any) -> None:
+        """COMPOSITE A: warning-only OUTER must let a breaking INNER extender's exception propagate.
+
+        The breaking extender (raise_on_error=True) runs inner to the warning-only
+        extender. When it raises, the outer warning-only fallback must NOT catch it,
+        must NOT re-run the breaking extender, and must NOT log a spurious warning.
+        """
+
+        base_calls = {"n": 0}
+
+        def base(x: int) -> int:
+            base_calls["n"] += 1
+            return x * 2
+
+        warn = MockExtender("warn", priority=10, raise_on_error=False)
+        breaking = MockExtender("boom", priority=20, should_fail=True, raise_on_error=True)
+        composite = CompositeExtender([warn, breaking])
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValueError, match="MockExtender boom intentionally failed"):
+                composite(base, 5)
+
+        assert breaking.call_count == 1, (
+            "Breaking inner extender must run exactly once; the outer warning-only fallback must not re-run it"
+        )
+        assert base_calls["n"] == 0, "Base function must not run when the breaking extender raises before delegating"
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING], (
+            "Warning-only outer extender must not log a spurious warning for the breaking inner extender's failure"
+        )
+
+    def test_warning_only_outer_does_not_swallow_never_fall_back_inner(self, caplog: Any) -> None:
+        """A warning-only OUTER must not swallow a never_fall_back INNER gate's refusal."""
+
+        base_calls = {"n": 0}
+
+        def base(x: int) -> int:
+            base_calls["n"] += 1
+            return x * 2
+
+        warn = MockExtender("outer", priority=10, raise_on_error=False)
+        gate = MockExtender("gate", priority=20, should_fail=True, raise_on_error=False, never_fall_back=True)
+        composite = CompositeExtender([warn, gate])
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValueError, match="MockExtender gate intentionally failed"):
+                composite(base, 5)
+
+        assert base_calls["n"] == 0, "A never_fall_back gate must never let the wrapped function run as a fallback"
+        assert gate.call_count == 1, (
+            "The never_fall_back gate must run exactly once; the outer warning-only fallback must not re-run it"
+        )
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING], (
+            "A never_fall_back gate's failure must not be logged as a fallback warning"
+        )
+
+    def test_warning_only_does_not_swallow_inner_function_error(self) -> None:
+        """COMPOSITE B: an inner-function exception through a warning-only extender propagates, single run."""
+
+        base_calls = {"n": 0}
+
+        def base() -> int:
+            base_calls["n"] += 1
+            raise RuntimeError("inner boom")
+
+        warn = MockExtender("warn", priority=10, raise_on_error=False)
+        composite = CompositeExtender([warn])
+
+        with pytest.raises(RuntimeError, match="inner boom"):
+            composite(base)
+
+        assert base_calls["n"] == 1, (
+            "The inner function must run exactly once; the warning-only wrapper must not swallow and re-run it"
+        )
+
+    def test_warning_only_post_failure_returns_computed_result_without_rerun(self, caplog: Any) -> None:
+        """COMPOSITE C: extender fails AFTER inner ran, must return already-computed result, no double run."""
+
+        base_calls = {"n": 0}
+
+        def base(x: int) -> int:
+            base_calls["n"] += 1
+            return x * 3
+
+        post_fail = _PostFailExtender("posty", priority=10)
+        composite = CompositeExtender([post_fail])
+
+        with caplog.at_level(logging.WARNING):
+            result = composite(base, 7)
+
+        assert result == 21, "Fallback must return the already-computed inner result"
+        assert base_calls["n"] == 1, (
+            "Inner function must run exactly once; no double execution after the extender's post-processing fails"
+        )
+        assert any(
+            r.levelno == logging.WARNING and "post boom" in r.message and "posty" in r.message for r in caplog.records
+        ), "The failing extender must be identified in a WARNING"
+
+    def test_never_fall_back_post_failure_propagates_without_fallback(self, caplog: Any) -> None:
+        """A never_fall_back extender failing AFTER inner ran must propagate, not return the computed result."""
+
+        base_calls = {"n": 0}
+
+        def base(x: int) -> int:
+            base_calls["n"] += 1
+            return x * 3
+
+        gate = _PostFailExtender("gate", priority=10, never_fall_back=True)
+        composite = CompositeExtender([gate])
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValueError, match="post boom"):
+                composite(base, 7)
+
+        assert base_calls["n"] == 1, "The wrapped function must run exactly once; the gate's failure must not re-run it"
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING], (
+            "A never_fall_back gate's post-delegation failure must not be logged as a fallback warning"
+        )
+
+
+class _TamperingExtender(Extender):
+    """Calls func for the real result, then returns a DIFFERENT value instead of it."""
+
+    def __init__(
+        self,
+        name: str,
+        priority: int = 100,
+        raise_on_error: bool = True,
+        never_fall_back: bool = False,
+        tampered: Any = "tampered",
+    ) -> None:
+        self.name = name
+        self.priority = priority
+        self.raise_on_error = raise_on_error
+        self.never_fall_back = never_fall_back
+        self._tampered = tampered
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        func(*args, **kwargs)
+        return self._tampered
+
+
+class _NeverCallsExtender(Extender):
+    """Never invokes the wrapped function at all; its own return value stays the fallback."""
+
+    def __init__(self, name: str, priority: int = 100, constant: Any = "constant") -> None:
+        self.name = name
+        self.priority = priority
+        self.raise_on_error = True
+        self._constant = constant
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return self._constant
+
+
+class _MultiCallExtender(Extender):
+    """Calls func twice with different args, returning the FIRST successful result."""
+
+    def __init__(self, name: str, priority: int = 100) -> None:
+        self.name = name
+        self.priority = priority
+        self.raise_on_error = True
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        real = func(*args, **kwargs)
+        other_args = ("SHADOW",) + args[1:]
+        func(*other_args, **kwargs)
+        return real
+
+
+class TestSingleExtenderPathHonorsRaiseOnError:
+    """The single-extender path (run_calculate_feature) must honor raise_on_error identically."""
+
+    @staticmethod
+    def _make_compute_framework(extenders: list[Extender]) -> Any:
+        cf = Mock(spec=ComputeFramework)
+        cf._hook_extenders = None
+        cf.data = "DATA"
+        cf.function_extender = extenders
+        cf.run_context = RunContext()
+        cf.worker_index = None
+        cf.get_function_extender = ComputeFramework.get_function_extender.__get__(cf)
+        cf.run_calculate_feature = ComputeFramework.run_calculate_feature.__get__(cf)
+        cf._raise_helpful_missing_column_error = ComputeFramework._raise_helpful_missing_column_error.__get__(cf)
+        cf._build_hook_context = ComputeFramework._build_hook_context.__get__(cf)
+        cf._run_hook = ComputeFramework._run_hook.__get__(cf)
+        cf.activate = ComputeFramework.activate.__get__(cf)
+        return cf
+
+    def test_single_default_extender_failure_propagates(self) -> None:
+        """A single DEFAULT extender that fails must propagate (symmetry with composite)."""
+
+        cf = self._make_compute_framework([MockExtender("boom", should_fail=True)])
+        fg = _FakeFeatureGroup()
+
+        with pytest.raises(ValueError, match="MockExtender boom intentionally failed"):
+            cf.run_calculate_feature(fg, "features")
+
+        assert fg.calc_count == 0, "Breaking extender must not fall back to calculate_feature"
+
+    def test_single_warning_only_extender_falls_back(self, caplog: Any) -> None:
+        """A single WARNING-ONLY extender that fails logs a warning and falls back to calculate_feature."""
+
+        cf = self._make_compute_framework([MockExtender("soft", should_fail=True, raise_on_error=False)])
+        fg = _FakeFeatureGroup()
+
+        with caplog.at_level(logging.WARNING):
+            result = cf.run_calculate_feature(fg, "features")
+
+        assert result == "calculated:DATA", "Warning-only extender should fall back to calculate_feature"
+        assert fg.calc_count == 1, "The wrapped calculate_feature should run exactly once as fallback"
+        assert any(
+            record.levelno == logging.WARNING and "MockExtender soft intentionally failed" in record.message
+            for record in caplog.records
+        ), "Warning-only failure should be logged at WARNING level on the single-extender path"
+
+    def test_single_warning_only_inner_keyerror_propagates_once(self) -> None:
+        """SINGLE D: an inner KeyError through a warning-only extender must not be swallowed/re-run.
+
+        The KeyError must propagate through the same handling a plain (no-extender)
+        KeyError would receive (the helpful ValueError), and calculate_feature must
+        run exactly once.
+        """
+
+        cf = self._make_compute_framework([MockExtender("soft", should_fail=False, raise_on_error=False)])
+        fg = _KeyErrorFeatureGroup()
+
+        with pytest.raises(ValueError, match="failed with a KeyError"):
+            cf.run_calculate_feature(fg, "features")
+
+        assert fg.calc_count == 1, (
+            "calculate_feature must run exactly once; the warning-only fallback must not re-run it on inner KeyError"
+        )
+
+    def test_single_warning_only_inner_runtime_error_propagates_once(self) -> None:
+        """SINGLE (analogue of B): an inner RuntimeError through a warning-only extender propagates, single run."""
+
+        cf = self._make_compute_framework([MockExtender("soft", should_fail=False, raise_on_error=False)])
+        fg = _RuntimeErrorFeatureGroup()
+
+        with pytest.raises(RuntimeError, match="inner boom"):
+            cf.run_calculate_feature(fg, "features")
+
+        assert fg.calc_count == 1, (
+            "calculate_feature must run exactly once on inner RuntimeError through a warning-only extender"
+        )
+
+
+class TestSingleExtenderCannotSubstituteTheCalculatedResult:
+    """The single-extender path must not let an extender substitute the real calculated result."""
+
+    @staticmethod
+    def _make_compute_framework(extenders: list[Extender]) -> Any:
+        cf = Mock(spec=ComputeFramework)
+        cf._hook_extenders = None
+        cf.data = "DATA"
+        cf.function_extender = extenders
+        cf.run_context = RunContext()
+        cf.worker_index = None
+        cf.get_function_extender = ComputeFramework.get_function_extender.__get__(cf)
+        cf.run_calculate_feature = ComputeFramework.run_calculate_feature.__get__(cf)
+        cf._raise_helpful_missing_column_error = ComputeFramework._raise_helpful_missing_column_error.__get__(cf)
+        cf._build_hook_context = ComputeFramework._build_hook_context.__get__(cf)
+        cf._run_hook = ComputeFramework._run_hook.__get__(cf)
+        cf.activate = ComputeFramework.activate.__get__(cf)
+        return cf
+
+    def test_single_default_extender_tampered_result_is_discarded(self) -> None:
+        cf = self._make_compute_framework([_TamperingExtender("tamper")])
+        fg = _FakeFeatureGroup()
+
+        result = cf.run_calculate_feature(fg, "features")
+
+        assert result == "calculated:DATA", "real result must win over the tampered one"
+        assert fg.calc_count == 1
+
+    def test_never_fall_back_tampered_result_is_discarded(self) -> None:
+        cf = self._make_compute_framework(
+            [_TamperingExtender("gate-tamper", raise_on_error=False, never_fall_back=True)]
+        )
+        fg = _FakeFeatureGroup()
+
+        result = cf.run_calculate_feature(fg, "features")
+
+        assert result == "calculated:DATA"
+        assert fg.calc_count == 1
+
+    def test_single_warning_only_extender_tampered_result_is_discarded(self) -> None:
+        cf = self._make_compute_framework([_TamperingExtender("warn-tamper", raise_on_error=False)])
+        fg = _FakeFeatureGroup()
+
+        result = cf.run_calculate_feature(fg, "features")
+
+        assert result == "calculated:DATA"
+        assert fg.calc_count == 1
+
+    def test_single_extender_that_never_calls_wrapped_function_returns_its_own_value(self) -> None:
+        cf = self._make_compute_framework([_NeverCallsExtender("skip", constant="own-value")])
+        fg = _FakeFeatureGroup()
+
+        result = cf.run_calculate_feature(fg, "features")
+
+        assert result == "own-value"
+        assert fg.calc_count == 0, "calculate_feature must never run when the extender never delegates to it"
+
+    def test_multi_call_extender_returns_result_of_first_successful_call(self) -> None:
+        cf = self._make_compute_framework([_MultiCallExtender("multi")])
+        fg = _FakeFeatureGroup()
+
+        result = cf.run_calculate_feature(fg, "features")
+
+        assert result == "calculated:DATA", "first successful call's result must win, not the shadow call's"
+        assert fg.calc_count == 2, "both the real call and the shadow call must have run"
+
+
+class _SwallowingExtender(Extender):
+    """Catches the inner exception and returns its own value."""
+
+    def __init__(self, name: str = "swallow", priority: int = 100, never_fall_back: bool = False) -> None:
+        self.name = name
+        self.priority = priority
+        self.never_fall_back = never_fall_back
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            return "swallowed"
+
+
+class _RetryingExtender(Extender):
+    """Calls func again after the first call raises."""
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except RuntimeError:
+            return func(*args, **kwargs)
+
+
+class TestGateTierOrdering:
+    def test_gate_with_higher_priority_number_sorts_first_in_build_hook_extenders(self) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        plain = MockExtender("plain", priority=1)
+        gate = MockExtender("gate", priority=900, never_fall_back=True)
+
+        built = build_hook_extenders([plain, gate])[ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE]
+
+        assert isinstance(built, CompositeExtender)
+        assert built.extenders == (gate, plain)
+
+    def test_composite_extender_puts_gate_outermost(self) -> None:
+        order: list[str] = []
+        plain = MockExtender("plain", priority=1)
+        gate = MockExtender("gate", priority=900, never_fall_back=True)
+
+        def plain_call(func: Any, *a: Any, **k: Any) -> Any:
+            order.append("plain")
+            return func(*a, **k)
+
+        def gate_call(func: Any, *a: Any, **k: Any) -> Any:
+            order.append("gate")
+            return func(*a, **k)
+
+        plain.__call__ = plain_call  # type: ignore[method-assign]
+        gate.__call__ = gate_call  # type: ignore[method-assign]
+
+        composite = CompositeExtender([plain, gate])
+        composite(lambda: 1)
+
+        assert composite.extenders[0] is gate
+        assert order == ["gate", "plain"]
+
+    def test_priority_still_orders_two_gates(self) -> None:
+        late = MockExtender("late", priority=50, never_fall_back=True)
+        early = MockExtender("early", priority=10, never_fall_back=True)
+        assert CompositeExtender([late, early]).extenders == (early, late)
+
+    def test_extender_sort_key_has_gate_tier_first(self) -> None:
+        from mloda.core.abstract_plugins.function_extender import extender_sort_key
+
+        gate = MockExtender("gate", priority=900, never_fall_back=True)
+        plain = MockExtender("plain", priority=1)
+        assert extender_sort_key(gate) < extender_sort_key(plain)
+
+
+class TestInnerExceptionReRaise:
+    def test_single_non_gate_swallowing_inner_exception_still_propagates(self) -> None:
+        cf = TestSingleExtenderPathHonorsRaiseOnError._make_compute_framework([_SwallowingExtender()])
+
+        with pytest.raises(RuntimeError, match="inner boom"):
+            cf.run_calculate_feature(_RuntimeErrorFeatureGroup(), "features")
+
+    def test_outer_gate_swallowing_inner_gate_refusal_propagates(self) -> None:
+        outer = _SwallowingExtender("outer", priority=1, never_fall_back=True)
+        inner = MockExtender("inner", priority=2, should_fail=True, never_fall_back=True)
+
+        with pytest.raises(ValueError, match="MockExtender inner intentionally failed"):
+            CompositeExtender([outer, inner])(lambda: "base")
+
+    def test_retrying_extender_whose_second_call_succeeds_returns_result(self) -> None:
+        calls = {"n": 0}
+
+        def flaky() -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("first")
+            return "ok"
+
+        assert CompositeExtender([_RetryingExtender()])(flaky) == "ok"
+        assert calls["n"] == 2
+
+
+class TestGateBypass:
+    def test_outer_that_never_calls_func_with_gate_inside_raises(self) -> None:
+        from mloda.steward import GateBypassError
+
+        skipper = _NeverCallsExtender("skipper", priority=1)
+        gate = MockExtender("gate", priority=2, never_fall_back=True)
+
+        # the gate is sorted outermost, so make the skipper the gate-bearing outer layer too
+        skipper.never_fall_back = True
+        with pytest.raises(GateBypassError, match="skipper"):
+            CompositeExtender([skipper, gate])(lambda: "base")
+
+
+class _ClassBodyGate(Extender):
+    never_fall_back = True
+    raise_on_run_complete = True
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+class TestSealOnFirstUse:
+    @pytest.mark.parametrize("attr", ["never_fall_back", "raise_on_run_complete"])
+    def test_class_flag_reassignment_does_not_change_sealed_instance(self, attr: str, monkeypatch: Any) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        ext = _ClassBodyGate()
+        build_hook_extenders([ext])
+
+        monkeypatch.setattr(_ClassBodyGate, attr, False)
+
+        assert getattr(ext, attr) is True
+
+    @pytest.mark.parametrize(
+        "attr, value",
+        [
+            ("raise_on_error", False),
+            ("priority", 1),
+            ("never_fall_back", True),
+            ("raise_on_run_complete", True),
+            ("_sealed", False),
+        ],
+    )
+    def test_flags_cannot_be_set_after_build_hook_extenders(self, attr: str, value: Any) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        ext = MockExtender("sealed")
+        build_hook_extenders([ext])
+
+        with pytest.raises(AttributeError):
+            setattr(ext, attr, value)
+
+    @pytest.mark.parametrize(
+        "attr, expected",
+        [("_sealed", True), ("never_fall_back", True), ("_priority", 7), ("_raise_on_error", True)],
+    )
+    def test_flags_cannot_be_deleted_after_build_hook_extenders(self, attr: str, expected: Any) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        ext = MockExtender("sealed", priority=7, never_fall_back=True)
+        build_hook_extenders([ext])
+
+        with pytest.raises(AttributeError):
+            delattr(ext, attr)
+        assert getattr(ext, attr) == expected
+
+    @pytest.mark.parametrize(
+        "forge",
+        [
+            lambda c: setattr(c, "never_fall_back", True),
+            lambda c: setattr(c, "extenders", []),
+            lambda c: setattr(c, "function_type", None),
+            lambda c: c.extenders.clear(),
+            lambda c: c.extenders.append(MockExtender("x")),
+            lambda c: setattr(c, "_sealed", False),
+            lambda c: delattr(c, "extenders"),
+        ],
+        ids=[
+            "never_fall_back",
+            "assign_extenders",
+            "assign_function_type",
+            "clear",
+            "append",
+            "unseal",
+            "del_extenders",
+        ],
+    )
+    def test_composite_built_by_build_hook_extenders_is_sealed(self, forge: Any) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        built: Any = build_hook_extenders([MockExtender("a", priority=1), MockExtender("b", priority=2)])[
+            ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE
+        ]
+        with pytest.raises(AttributeError):
+            forge(built)
+        assert len(built.extenders) == 2
+        assert built.function_type is ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE
+
+    def test_one_shot_iterator_of_two_extenders_seals_children_and_composite(self) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        first = MockExtender("a", priority=1)
+        second = MockExtender("b", priority=2)
+
+        built = build_hook_extenders(iter([first, second]))[ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE]
+
+        assert isinstance(built, CompositeExtender)
+        for sealed in (first, second, built):
+            with pytest.raises(AttributeError):
+                sealed.priority = 9
+
+    def test_sealing_is_idempotent_and_non_flag_attributes_stay_writable(self) -> None:
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        ext = MockExtender("idem")
+        build_hook_extenders([ext])
+        build_hook_extenders([ext])
+        ext.call_count = 5
+        assert ext.call_count == 5
+
+    def test_pickle_round_trip_stays_sealed(self) -> None:
+        import pickle  # nosec B403
+
+        from mloda.core.abstract_plugins.function_extender import build_hook_extenders
+
+        ext = MockExtender("picklable", priority=3)
+        build_hook_extenders([ext])
+        clone = pickle.loads(pickle.dumps(ext))  # nosec B301
+
+        with pytest.raises(AttributeError):
+            clone.priority = 9
+
+
+class TestCompositeNeverFallBack:
+    @pytest.mark.parametrize(("gate_child", "expected"), [(True, True), (False, False)])
+    def test_composite_is_gate_iff_a_child_is_gate(self, gate_child: bool, expected: bool) -> None:
+        composite = CompositeExtender([MockExtender("g", never_fall_back=gate_child), MockExtender("p")])
+        assert composite.never_fall_back is expected

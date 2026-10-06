@@ -1,0 +1,246 @@
+import inspect
+from typing import Any
+
+from mloda.core.abstract_plugins.components.contract.comparison_contract import ColumnSemantics
+from mloda.core.abstract_plugins.components.link import AsOfJoinConfig
+from mloda.user import Index
+from mloda.user import JoinType
+from mloda.provider import BaseMergeEngine
+from mloda_plugins.compute_framework.base_implementations.polars import polars_type_semantics
+
+try:
+    import polars as pl
+except ImportError:
+    pl = None  # type: ignore[assignment]
+
+_JOIN_SUPPORTS_COALESCE = pl is not None and "coalesce" in inspect.signature(pl.DataFrame.join).parameters
+
+
+class PolarsMergeEngine(BaseMergeEngine):
+    provides_column_semantics = True
+
+    def check_import(self) -> None:
+        if pl is None:
+            raise ImportError("Polars is not installed. To be able to use this framework, please install polars.")
+
+    def merge_inner(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        return self.join_logic("inner", left_data, right_data, left_index, right_index, JoinType.INNER)
+
+    def merge_left(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        return self.join_logic("left", left_data, right_data, left_index, right_index, JoinType.LEFT)
+
+    def merge_right(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        return self.join_logic("right", left_data, right_data, left_index, right_index, JoinType.RIGHT)
+
+    def merge_full_outer(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        return self.join_logic("full", left_data, right_data, left_index, right_index, JoinType.OUTER)
+
+    def merge_append(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        return self.pl_concat()([left_data, right_data], how="diagonal")
+
+    def merge_union(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        combined = self.merge_append(left_data, right_data, left_index, right_index)
+        return combined.unique()
+
+    def merge_asof(
+        self,
+        left_data: Any,
+        right_data: Any,
+        left_index: Index,
+        right_index: Index,
+        asof_config: AsOfJoinConfig,
+    ) -> Any:
+        left_data, right_data = self.validate_asof_time_columns(left_data, right_data, asof_config)
+        by_left = list(left_index.index)
+        by_right = list(right_index.index)
+        lt, rt = asof_config.left_time_column, asof_config.right_time_column
+        left_cols = self.get_column_names(left_data)
+        right_cols = self.get_column_names(right_data)
+
+        left_sorted = left_data.sort(lt)
+        right_sorted = right_data.sort(rt)
+
+        kwargs: dict[str, Any] = {
+            "strategy": asof_config.direction,
+            "allow_exact_matches": asof_config.allow_exact_matches,
+        }
+        if asof_config.tolerance is not None:
+            kwargs["tolerance"] = asof_config.tolerance
+
+        result = left_sorted.join_asof(
+            right_sorted, left_on=lt, right_on=rt, by_left=by_left, by_right=by_right, check_sortedness=False, **kwargs
+        )
+
+        # Re-add any right by-key whose name differs from its left counterpart (polars drops it).
+        for l_key, r_key in zip(by_left, by_right):
+            if r_key != l_key and r_key not in left_cols:
+                result = result.with_columns(
+                    pl.when(pl.col(rt).is_not_null()).then(pl.col(l_key)).otherwise(None).alias(r_key)
+                )
+
+        # Canonical column order: all left cols, then right cols not present in left.
+        desired = list(left_cols) + [c for c in right_cols if c not in left_cols]
+        present = self.get_column_names(result)
+        result = result.select([c for c in desired if c in present])
+        return result
+
+    def _column_semantics(self, data: Any, column: str) -> ColumnSemantics:
+        return polars_type_semantics.column_semantics(data, column)
+
+    def _asof_time_column_is_ordered(self, data: Any, column: str) -> bool:
+        dtype = data.collect_schema()[column]
+        return bool(dtype.is_numeric() or dtype.is_temporal())
+
+    def _coerce_asof_time_column(self, data: Any, column: str) -> Any:
+        return data.with_columns(pl.col(column).str.to_datetime(time_unit="us", strict=True))
+
+    def get_column_names(self, data: Any) -> list[str]:
+        """Get column names from data. Override in subclasses for different data types."""
+        return list(data.columns)
+
+    def is_empty_data(self, data: Any) -> bool:
+        """Check if data is empty. Override in subclasses for different data types."""
+        return len(data) == 0
+
+    def column_exists_in_result(self, result: Any, column_name: str) -> bool:
+        """Check if column exists in result. Override in subclasses for different data types."""
+        return column_name in result.columns
+
+    def handle_empty_data(
+        self,
+        left_data: Any,
+        right_data: Any,
+        left_idx: str | list[str],
+        right_idx: str | list[str],
+        join_type: str = "inner",
+    ) -> Any:
+        """Handle empty data cases. Override in subclasses for different data types."""
+        if self.is_empty_data(left_data) or self.is_empty_data(right_data):
+            # For empty datasets, create compatible schemas
+            if self.is_empty_data(left_data) and self.is_empty_data(right_data):
+                # Both empty - return empty with combined schema
+                combined_schema = {}
+                for col in self.get_column_names(left_data):
+                    combined_schema[col] = left_data[col].dtype
+                for col in self.get_column_names(right_data):
+                    if col not in combined_schema:
+                        combined_schema[col] = right_data[col].dtype
+                return pl.DataFrame(schema=combined_schema)
+            elif join_type != "inner":
+                # Left/right/outer with one side empty: let the native join run, it handles this correctly.
+                return None
+            elif self.is_empty_data(left_data):
+                # Left empty - ensure left has compatible schema with right join column
+                left_schema = dict(left_data.schema)
+                # Handle both single and multi-index
+                left_cols = [left_idx] if isinstance(left_idx, str) else left_idx
+                right_cols = [right_idx] if isinstance(right_idx, str) else right_idx
+                for i, left_col in enumerate(left_cols):
+                    if left_col in self.get_column_names(right_data):
+                        left_schema[left_col] = right_data[right_cols[i]].dtype
+                return pl.DataFrame(schema=left_schema)
+            else:
+                # Right empty - ensure right has compatible schema with left join column
+                right_schema = dict(right_data.schema)
+                # Handle both single and multi-index
+                left_cols = [left_idx] if isinstance(left_idx, str) else left_idx
+                right_cols = [right_idx] if isinstance(right_idx, str) else right_idx
+                for i, right_col in enumerate(right_cols):
+                    if right_col in self.get_column_names(left_data):
+                        right_schema[right_col] = left_data[left_cols[i]].dtype
+                return pl.DataFrame(schema=right_schema)
+        return None
+
+    def _align_empty_side_join_key_dtypes(
+        self, left_data: Any, right_data: Any, left_idx: str | list[str], right_idx: str | list[str]
+    ) -> tuple[Any, Any]:
+        """Cast an empty side's join key column(s) to the non-empty side's dtype, no-op otherwise."""
+        left_cols = [left_idx] if isinstance(left_idx, str) else left_idx
+        right_cols = [right_idx] if isinstance(right_idx, str) else right_idx
+        left_empty = self.is_empty_data(left_data)
+        right_empty = self.is_empty_data(right_data)
+        if left_empty and not right_empty:
+            for l_col, r_col in zip(left_cols, right_cols):
+                if l_col in self.get_column_names(left_data) and r_col in self.get_column_names(right_data):
+                    left_data = left_data.with_columns(pl.col(l_col).cast(right_data[r_col].dtype))
+        elif right_empty and not left_empty:
+            for l_col, r_col in zip(left_cols, right_cols):
+                if l_col in self.get_column_names(left_data) and r_col in self.get_column_names(right_data):
+                    right_data = right_data.with_columns(pl.col(r_col).cast(left_data[l_col].dtype))
+        return left_data, right_data
+
+    def join_logic(
+        self, join_type: str, left_data: Any, right_data: Any, left_index: Index, right_index: Index, jointype: JoinType
+    ) -> Any:
+        left_idx: str | list[str]
+        right_idx: str | list[str]
+        if left_index.is_multi_index() or right_index.is_multi_index():
+            left_idx = list(left_index.index)
+            right_idx = list(right_index.index)
+        else:
+            left_idx = left_index.index[0]
+            right_idx = right_index.index[0]
+
+        # Handle empty data cases
+        empty_result = self.handle_empty_data(left_data, right_data, left_idx, right_idx, join_type)
+        if empty_result is not None:
+            return empty_result
+
+        # An empty side's join key infers Null dtype, which polars' join rejects against the typed side.
+        left_data, right_data = self._align_empty_side_join_key_dtypes(left_data, right_data, left_idx, right_idx)
+
+        # For differing single-key names, keep both keys via coalesce=False (correct null semantics).
+        # Only pass coalesce when the installed polars supports it; older versions degrade to legacy behavior.
+        different_single_key = isinstance(left_idx, str) and isinstance(right_idx, str) and left_idx != right_idx
+        join_kwargs: dict[str, Any] = {"left_on": left_idx, "right_on": right_idx, "how": join_type}
+        if different_single_key and _JOIN_SUPPORTS_COALESCE:
+            join_kwargs["coalesce"] = False
+
+        # Perform the join with nulls_equal=True to match null values (updated parameter name)
+        try:
+            result = left_data.join(right_data, nulls_equal=True, **join_kwargs)
+        except TypeError:
+            # Fallback for older polars versions
+            result = left_data.join(right_data, join_nulls=True, **join_kwargs)
+
+        # Single-index specific post-processing
+        if isinstance(left_idx, str) and isinstance(right_idx, str):
+            # Handle duplicate join columns only for full outer joins when column names are the same
+            right_col_name = f"{right_idx}_right"
+            if self.column_exists_in_result(result, right_col_name) and join_type == "full" and left_idx == right_idx:
+                # For full outer joins with same column names, coalesce the columns
+                # Use the right column value when left is null, otherwise use left
+                result = result.with_columns(
+                    pl.when(pl.col(left_idx).is_null())
+                    .then(pl.col(right_col_name))
+                    .otherwise(pl.col(left_idx))
+                    .alias(left_idx)
+                ).drop(right_col_name)
+
+            # Ensure consistent column ordering: join column first, then left columns, then right columns
+            left_cols = [col for col in self.get_column_names(left_data) if col != left_idx]
+            right_cols = [
+                col
+                for col in self.get_column_names(right_data)
+                if col != right_idx and col not in self.get_column_names(left_data)
+            ]
+
+            # For different join column names, include the right join column in the ordering
+            if left_idx != right_idx:
+                right_cols = [right_idx] + right_cols
+
+            # Build the desired column order
+            desired_order = [left_idx] + left_cols + right_cols
+
+            # Select columns in the desired order (only if they exist in result)
+            result_columns = self.get_column_names(result)
+            existing_cols = [col for col in desired_order if col in result_columns]
+            result = result.select(existing_cols)
+
+        return result
+
+    @staticmethod
+    def pl_concat() -> Any:
+        if pl is None:
+            raise ImportError("Polars is not installed. To be able to use this framework, please install polars.")
+        return pl.concat

@@ -1,0 +1,868 @@
+import contextlib
+from copy import deepcopy
+from dataclasses import replace
+from datetime import datetime, timezone
+from collections.abc import Sequence
+from typing import Any, Callable, Generator
+
+from mloda.core.abstract_plugins.components.input_data.api.api_input_data_collection import (
+    ApiInputDataCollection,
+)
+from mloda.core.abstract_plugins.components.plugin_option.plugin_collector import PluginCollector
+
+# Explicit alias re-exports Engine under no_implicit_reexport so tests can patch mloda.core.api.request.Engine.
+from mloda.core.core.engine import Engine as Engine
+from mloda.core.api.plan_info import PlanStep, build_plan_steps
+from mloda.core.api.plan_lock import plan_content_hash, plan_structure_hash
+from mloda.core.prepare.identify_feature_group import (
+    ComputeFrameworkPinError,
+    FeatureResolutionError,
+)
+from mloda.core.prepare.resolution_types import (
+    ResolutionDiagnosis,
+    ResolutionRecord,
+)
+from mloda.core.api.run_result import ResultStream, RunResult
+from mloda.core.api.prepare.setup_compute_framework import SetupComputeFramework
+from mloda.core.prepare.accessible_plugins import (
+    EnvironmentPreconditionError,
+    FrameworkDeclarationError,
+    RedefinitionConflictError,
+    filter_extenders_by_strict_mode,
+)
+from mloda.core.filter.global_filter import GlobalFilter
+from mloda.core.runtime.run import ExecutionOrchestrator
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.function_extender import (
+    Extender,
+    ExtenderHook,
+    GateBypassError,
+    LifecycleOutcome,
+    call_contained_hook,
+    call_run_complete_hook,
+    call_run_start_hook,
+    reject_old_run_complete_signature,
+)
+from mloda.core.abstract_plugins.plan_context import PlanContext
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.core.abstract_plugins.verified_context import current_verified_context
+from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.components.feature_collection import Features
+from mloda.core.abstract_plugins.components.feature import Feature
+from mloda.core.abstract_plugins.components.link import Link
+from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+from mloda.core.runtime.run_id import generate_run_id
+
+
+class SetupConfigurationError(ValueError):
+    """Invalid mlodaAPI setup argument, raised before any feature resolution runs."""
+
+
+class mlodaAPI:
+    """Main API for executing mloda feature requests.
+
+    Two usage patterns:
+        Batch: ``mlodaAPI.run_all(features, ...)`` — configure and execute in one call.
+        Two-phase: ``session = mlodaAPI.prepare(features, ...)`` then ``session.run(api_data=...)``
+        — reuse the same session with different data (e.g. realtime inference).
+
+    For JSON-based feature configuration, see ``load_features_from_config()``.
+    """
+
+    def __init__(
+        self,
+        requested_features: Features | list[Feature | str],
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
+        output_framework: str | type[ComputeFramework] | None = None,
+    ) -> None:
+        self.runner: None | ExecutionOrchestrator = None
+        self.engine: None | Engine = None
+        self.function_extender = function_extender
+        self.plugin_collector = plugin_collector
+        filtered = filter_extenders_by_strict_mode(function_extender, plugin_collector)
+        self._extenders: set[Extender] = set(filtered) if filtered is not None else set()
+        reject_old_run_complete_signature(self._extenders)
+        self._plan_steps: tuple[PlanStep, ...] | None = None
+        verified = current_verified_context()
+        self.plan_context = PlanContext(
+            plan_id=generate_run_id(),
+            tenant_id=verified.tenant_id if verified else None,
+            project_id=verified.project_id if verified else None,
+            principal=verified.principal if verified else None,
+            created_at=datetime.now(timezone.utc),
+        )
+        self.plan_id = self.plan_context.plan_id
+
+        call_contained_hook(self._extenders, "on_plan_start", self.plan_context)
+        plan_outcome = LifecycleOutcome("succeeded")
+        try:
+            self._plan(
+                requested_features,
+                compute_frameworks,
+                links,
+                data_access_collection,
+                global_filter,
+                api_data,
+                copy_features,
+                strict_type_enforcement,
+                column_ordering,
+                parallelization_modes,
+                output_framework,
+            )
+            if self._extenders:
+                self._stamp_structure_hash()
+        except BaseException as error:
+            plan_outcome = LifecycleOutcome("failed", type(error).__name__)
+            raise
+        finally:
+            call_contained_hook(self._extenders, "on_plan_complete", self.plan_context, plan_outcome)
+
+    def _stamp_structure_hash(self) -> None:
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        self._plan_steps = tuple(self.resolved_plan())
+        self.plan_context = replace(
+            self.plan_context,
+            structure_hash=plan_structure_hash(self._plan_steps),
+            content_hash=plan_content_hash(self._plan_steps),
+        )
+        self.engine.plan_context = self.plan_context
+
+    def _plan(
+        self,
+        requested_features: Features | list[Feature | str],
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None,
+        links: set[Link] | None,
+        data_access_collection: DataAccessCollection | None,
+        global_filter: GlobalFilter | None,
+        api_data: dict[str, dict[str, Any]] | None,
+        copy_features: bool,
+        strict_type_enforcement: bool,
+        column_ordering: str | None,
+        parallelization_modes: set[ParallelizationMode] | None,
+        output_framework: str | type[ComputeFramework] | None,
+    ) -> None:
+        # Setup boundary: any invalid request argument surfaces as the typed error before planning.
+        try:
+            if column_ordering is not None and column_ordering not in ("alphabetical", "request_order"):
+                raise SetupConfigurationError(
+                    f"column_ordering must be None, 'alphabetical', or 'request_order', got '{column_ordering}'"
+                )
+            self.column_ordering = column_ordering
+            # The features object is potentially changed during the run, so we need to deepcopy it by default, so that follow up runs with the same object are not affected.
+            # Set copy_features=False to disable deep copying for use cases where features contain non-copyable objects.
+            _requested_features = deepcopy(requested_features) if copy_features else requested_features
+
+            # Handle api_data: create ApiInputDataCollection if api_data provided
+            api_input_data_collection: ApiInputDataCollection | None = None
+            if api_data is not None and len(api_data) > 0:
+                api_input_data_collection = ApiInputDataCollection()
+                column_owner: dict[str, str] = {}
+                for key_name, key_data in api_data.items():
+                    for column in key_data:
+                        if column in column_owner:
+                            raise ValueError(
+                                f"Column '{column}' appears in api_data sets '{column_owner[column]}' and "
+                                f"'{key_name}'; column names must be unique across sets."
+                            )
+                        column_owner[column] = key_name
+                    api_input_data_collection.setup_key_class(key_name, list(key_data.keys()))
+
+            self.strict_type_enforcement = strict_type_enforcement
+            self.features = self._process_features(_requested_features, api_input_data_collection)
+            setup_compute_framework = SetupComputeFramework(
+                compute_frameworks,
+                self.features,
+                parallelization_modes=parallelization_modes,
+                output_framework=output_framework,
+            )
+            self.compute_framework = setup_compute_framework.compute_frameworks
+            self.framework_preference = setup_compute_framework.framework_preference
+            self.links = links
+            self.data_access_collection = data_access_collection
+            self.global_filter = global_filter
+            self.api_input_data_collection = api_input_data_collection
+            self.api_data = api_data
+            self.output_framework = setup_compute_framework.output_framework
+        except SetupConfigurationError:
+            raise
+        except ValueError as error:
+            raise SetupConfigurationError(str(error)) from error
+
+        self.engine = self._create_engine()
+
+    def _process_features(
+        self,
+        requested_features: Features | list[Feature | str],
+        api_input_data_collection: ApiInputDataCollection | None,
+    ) -> Features:
+        """Processes the requested features, ensuring they are in the correct format and adding API input data."""
+        features = requested_features if isinstance(requested_features, Features) else Features(requested_features)
+
+        for feature in features:
+            feature.initial_requested_data = True
+            # Framework stamps below are never the feature's own declaration.
+            feature.options.lock_own_keys()
+            self._add_api_input_data(feature, api_input_data_collection)
+            # Propagate strict_type_enforcement to typed features only
+            if self.strict_type_enforcement and feature.data_type is not None:
+                feature.options.add_to_group(DefaultOptionKeys.strict_type_enforcement, True)
+
+        return features
+
+    @classmethod
+    def run_all(
+        cls,
+        features: Features | list[Feature | str],
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: str | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
+        graceful_shutdown_timeout: float = 2.0,
+        output_framework: str | type[ComputeFramework] | None = None,
+    ) -> RunResult:
+        """
+        Run feature computation in one step.
+
+        Args:
+            features: Features to compute.
+            compute_frameworks: Ordered list of compute frameworks to use; cheapest plan first, then list order.
+            links: Links between feature groups.
+            data_access_collection: Data access configuration.
+            parallelization_modes: Parallelization modes.
+            flight_server: Flight server for distributed processing.
+            function_extender: Function extenders.
+            global_filter: Global filter configuration.
+            api_data: Runtime API data as ``{"KeyName": {"column": [values]}}``.
+                KeyName is an arbitrary label grouping related columns into
+                one input source (e.g. ``"CustomerData"``). During feature
+                resolution, columns listed under a KeyName are matched to
+                requested features by name. Multiple KeyNames allow passing
+                independent datasets in a single call. Each set returns its own
+                result frame (order not guaranteed); a column name shared by two
+                sets raises ``SetupConfigurationError``.
+            plugin_collector: Plugin collector.
+            copy_features: Whether to deep copy features (default True).
+            strict_type_enforcement: If True, enforce strict type matching for typed features.
+            carrier: Opaque W3C trace-context carrier dict, forwarded to every ``HookContext``.
+            child_bootstrap: Picklable, no-argument callable run once in a spawned
+                MULTIPROCESSING worker before it processes its first command.
+            graceful_shutdown_timeout: Seconds a MULTIPROCESSING worker gets to run its
+                extenders' close() before being terminated, shared across every extender in
+                that worker.
+
+        Returns:
+            ``RunResult``, a list of computed results, one per feature group, in ``result.plan``
+            order. Each element is a compute-framework object
+            (e.g. ``pd.DataFrame``, ``pa.Table``) containing only the columns
+            for the requested features resolved by that group. When all
+            requested features resolve to a single group, the list has one
+            element. ``result.plan`` exposes the resolved plan of this run, and
+            ``result.frames()`` pairs each result with the ``PlanStep`` that produced it.
+
+        Example:
+            result = mloda.run_all(
+                features,
+                api_data={"UserQuery": {"row_index": [0], "query": ["hello"]}}
+            )
+        """
+        session = cls.prepare(
+            features,
+            compute_frameworks,
+            links,
+            data_access_collection,
+            global_filter,
+            api_data=api_data,
+            plugin_collector=plugin_collector,
+            copy_features=copy_features,
+            strict_type_enforcement=strict_type_enforcement,
+            column_ordering=column_ordering,
+            parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
+            output_framework=output_framework,
+        )
+        results = session.run(
+            api_data=api_data,
+            parallelization_modes=parallelization_modes,
+            flight_server=flight_server,
+            carrier=carrier,
+            child_bootstrap=child_bootstrap,
+            graceful_shutdown_timeout=graceful_shutdown_timeout,
+        )
+        plan = session.resolved_plan()
+        result_items = session.runner.get_result_items() if session.runner is not None else None
+        if result_items is not None:
+            position = {step.step_uuid: index for index, step in enumerate(plan)}
+            result_items = sorted(result_items, key=lambda item: position.get(item[0], len(position)))
+            results = [result for _, result in result_items]
+        return RunResult(results, plan, result_items)
+
+    @classmethod
+    def stream_all(
+        cls,
+        features: Features | list[Feature | str],
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: str | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
+        graceful_shutdown_timeout: float = 2.0,
+        output_framework: str | type[ComputeFramework] | None = None,
+    ) -> ResultStream:
+        """Stream results at feature-group granularity.
+
+        Like ``run_all`` but yields each feature group's result as it completes.
+        ``list(stream_all(...))`` carries the same elements as ``run_all(...)``. Planning happens
+        eagerly at the call; the returned ``ResultStream`` exposes ``plan`` before iteration.
+        ``carrier``/``child_bootstrap``/``graceful_shutdown_timeout`` behave as in ``run_all``. Unlike
+        ``run_all``, it yields in completion order, which can differ from ``run_all``'s plan order under
+        THREADING/MULTIPROCESSING.
+
+        Returns:
+            ``ResultStream`` yielding one complete result per feature group; ``stream.frames()`` pairs each
+            result with the ``PlanStep`` that produced it.
+        """
+        session = cls.prepare(
+            features,
+            compute_frameworks,
+            links,
+            data_access_collection,
+            global_filter,
+            api_data=api_data,
+            plugin_collector=plugin_collector,
+            copy_features=copy_features,
+            strict_type_enforcement=strict_type_enforcement,
+            column_ordering=column_ordering,
+            parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
+            output_framework=output_framework,
+        )
+        # Planning is eager in prepare, so the plan snapshot is available before iteration.
+        return ResultStream(
+            session._start_stream(
+                api_data=api_data,
+                parallelization_modes=parallelization_modes,
+                flight_server=flight_server,
+                artifacts=None,
+                carrier=carrier,
+                child_bootstrap=child_bootstrap,
+                with_step_uuids=True,
+                graceful_shutdown_timeout=graceful_shutdown_timeout,
+            ),
+            session.resolved_plan(),
+        )
+
+    @classmethod
+    def prepare(
+        cls,
+        features: Features | list[Feature | str],
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
+        output_framework: str | type[ComputeFramework] | None = None,
+    ) -> "mlodaAPI":
+        """Build an execution plan without running it.
+
+        Returns a configured mlodaAPI session. Call ``session.run()`` to execute,
+        optionally passing fresh ``api_data`` each time.
+        """
+        return cls(
+            features,
+            compute_frameworks,
+            links,
+            data_access_collection,
+            global_filter,
+            api_data=api_data,
+            plugin_collector=plugin_collector,
+            copy_features=copy_features,
+            strict_type_enforcement=strict_type_enforcement,
+            column_ordering=column_ordering,
+            parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
+            output_framework=output_framework,
+        )
+
+    @classmethod
+    def explain(
+        cls,
+        features: Features | list[Feature | str],
+        *,
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
+        output_framework: str | type[ComputeFramework] | None = None,
+    ) -> list[PlanStep]:
+        """Resolve the execution plan without executing it.
+
+        Same as ``prepare(...).resolved_plan()``: no feature is computed. The plan is re-resolved
+        from scratch, so this answers "what would this request resolve to", not "what did a previous
+        ``run_all`` execute". To mirror a ``run_all`` resolution, pass the same
+        ``parallelization_modes``: ``run_all`` defaults to ``{ParallelizationMode.SYNC}`` while
+        ``prepare``/``explain`` default to None, and ``SetupComputeFramework`` filters compute
+        frameworks by mode.
+
+        Every parameter after ``features`` is keyword-only.
+        """
+        session = cls.prepare(
+            features,
+            compute_frameworks,
+            links,
+            data_access_collection,
+            global_filter,
+            api_data=api_data,
+            plugin_collector=plugin_collector,
+            copy_features=copy_features,
+            strict_type_enforcement=strict_type_enforcement,
+            column_ordering=column_ordering,
+            parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
+            output_framework=output_framework,
+        )
+        return session.resolved_plan()
+
+    @classmethod
+    def diagnose(
+        cls,
+        features: Features | list[Feature | str],
+        *,
+        compute_frameworks: Sequence[str | type[ComputeFramework]] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
+        output_framework: str | type[ComputeFramework] | None = None,
+    ) -> ResolutionDiagnosis:
+        """Whole-request resolution preflight that does not raise on resolution or setup failures.
+
+        Runs the same eager planning as prepare() but projects the outcome instead of raising: on success
+        records equals resolution_report() with complete True; on a resolution failure records holds the
+        features resolved before the failing one (from the error payload, capped at PARTIAL_RECORDS_CAP on
+        huge requests) plus that feature's EvaluationResult and rendered message. A SetupConfigurationError
+        (any invalid request argument caught during session setup, before planning, for example an invalid
+        column_ordering or an unknown compute framework name) yields only the message. Environment-build
+        failures (EnvironmentPreconditionError, RedefinitionConflictError, FrameworkDeclarationError) and
+        compute-framework pin misuse (ComputeFrameworkPinError) are likewise projected into the diagnosis
+        instead of raising; any other error propagates, including an exception a breaking extender raises unless
+        it is one of the types above. Every parameter after features is keyword-only.
+        """
+        try:
+            session = cls(
+                features,
+                compute_frameworks,
+                links,
+                data_access_collection,
+                global_filter,
+                api_data=api_data,
+                plugin_collector=plugin_collector,
+                copy_features=copy_features,
+                strict_type_enforcement=strict_type_enforcement,
+                column_ordering=column_ordering,
+                parallelization_modes=parallelization_modes,
+                function_extender=function_extender,
+                output_framework=output_framework,
+            )
+        except FeatureResolutionError as error:
+            return ResolutionDiagnosis(
+                records=list(error.partial_records),
+                complete=False,
+                feature_name=error.feature_name,
+                failed_result=deepcopy(error.result),
+                message=str(error),
+            )
+        except (
+            ComputeFrameworkPinError,
+            EnvironmentPreconditionError,
+            RedefinitionConflictError,
+            FrameworkDeclarationError,
+        ) as error:
+            return ResolutionDiagnosis(records=[], complete=False, message=str(error))
+        except SetupConfigurationError as error:
+            return ResolutionDiagnosis(records=[], complete=False, message=str(error))
+        return ResolutionDiagnosis(records=session.resolution_report(), complete=True)
+
+    def resolved_plan(self) -> list[PlanStep]:
+        """Return the resolved execution plan of this session as ``PlanStep`` records.
+
+        Available after ``prepare()`` and unchanged by ``run()``. Steps are in dependency order,
+        independent ones sorted by content.
+        """
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        return build_plan_steps(
+            self.engine.execution_planner,
+            self.engine.execution_planner.resolved_join_plan,
+            specialized_from=self.engine.specialized_from,
+            output_framework=self.engine.output_framework,
+        )
+
+    def resolution_report(self) -> list[ResolutionRecord]:
+        """Return this session's per-feature resolution records, captured during planning.
+
+        Available after ``prepare()`` and unchanged by ``run()``. Mirrors ``resolved_plan()``.
+        """
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        return deepcopy(self.engine.resolution_records)
+
+    def _build_run_context(
+        self,
+        carrier: dict[str, str] | None,
+        child_bootstrap: Callable[[], None] | None,
+        graceful_shutdown_timeout: float = 2.0,
+    ) -> RunContext:
+        """Derive this run's context from the engine's plan-time base."""
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        identity = current_verified_context() or self.plan_context
+        return replace(
+            self.engine.run_context,
+            run_id=generate_run_id(),
+            started_at=datetime.now(timezone.utc),
+            carrier=carrier,
+            child_bootstrap=child_bootstrap,
+            graceful_shutdown_timeout=graceful_shutdown_timeout,
+            tenant_id=identity.tenant_id,
+            project_id=identity.project_id,
+            principal=identity.principal,
+            structure_hash=self.plan_context.structure_hash,
+        )
+
+    def run(
+        self,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        flight_server: Any | None = None,
+        artifacts: dict[str, Any] | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
+        graceful_shutdown_timeout: float = 2.0,
+    ) -> list[Any]:
+        """Execute the prepared session and return results.
+
+        Can be called multiple times on the same session with different ``api_data``
+        and/or ``artifacts`` to re-run the execution plan against new inputs.
+
+        Args:
+            api_data: Fresh runtime data, replacing any data from prepare().
+            artifacts: Artifact dict from a previous run's ``get_artifacts()``.
+                When provided, feature groups with matching artifact names
+                switch to load mode for this run, enabling train-then-predict
+                workflows without re-preparing.
+            carrier/child_bootstrap: See ``run_all``. Like ``run_id`` (minted per
+                call), ``carrier`` may differ on each ``run()`` call.
+            graceful_shutdown_timeout: Seconds a MULTIPROCESSING worker gets to run its
+                extenders' ``close()`` before being terminated, shared across every extender in
+                that worker.
+        """
+        self._batch_run(
+            parallelization_modes,
+            flight_server,
+            api_data=api_data,
+            artifacts=artifacts,
+            run_context=self._build_run_context(carrier, child_bootstrap, graceful_shutdown_timeout),
+        )
+        return self.get_result()
+
+    def stream_run(
+        self,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        flight_server: Any | None = None,
+        artifacts: dict[str, Any] | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
+        graceful_shutdown_timeout: float = 2.0,
+    ) -> Generator[Any, None, None]:
+        """Execute the prepared session and yield each feature group's result as it completes.
+
+        carrier/child_bootstrap and the active verified_context() scope are read here, at call
+        time, not at first iteration: a function whose body itself contains ``yield`` only starts
+        executing on first iteration, which would defer that read past the caller's intended scope.
+        """
+        return self._start_stream(
+            api_data,
+            parallelization_modes,
+            flight_server,
+            artifacts,
+            carrier,
+            child_bootstrap,
+            with_step_uuids=False,
+            graceful_shutdown_timeout=graceful_shutdown_timeout,
+        )
+
+    def _start_stream(
+        self,
+        api_data: dict[str, dict[str, Any]] | None,
+        parallelization_modes: set[ParallelizationMode],
+        flight_server: Any | None,
+        artifacts: dict[str, Any] | None,
+        carrier: dict[str, str] | None,
+        child_bootstrap: Callable[[], None] | None,
+        with_step_uuids: bool,
+        graceful_shutdown_timeout: float = 2.0,
+    ) -> Generator[Any, None, None]:
+        """Eager setup for ``stream_run``/``stream_all``; no yield, so carrier/verified_context read at call time."""
+        _api_data = api_data if api_data is not None else self.api_data
+        run_context = self._build_run_context(carrier, child_bootstrap, graceful_shutdown_timeout)
+        stream = self._stream_run_results(
+            flight_server, parallelization_modes, _api_data, artifacts, run_context, with_step_uuids
+        )
+        # Primes the generator so a refusal at run start raises here, not on first iteration.
+        next(stream)
+        return stream
+
+    def _start_run(self, run_context: RunContext) -> None:
+        """Refuse an unguarded identity change, then fire on_run_start."""
+        if not self._extenders:
+            return
+        plan = self.plan_context
+        identity_changed = (run_context.tenant_id, run_context.project_id, run_context.principal) != (
+            plan.tenant_id,
+            plan.project_id,
+            plan.principal,
+        )
+        matched_hook = self.engine.get_function_extender(ExtenderHook.FEATURE_GROUP_MATCHED) if self.engine else None
+        if identity_changed and matched_hook is not None and matched_hook.never_fall_back:
+            gates = [
+                e for e in self._extenders if e.never_fall_back and ExtenderHook.FEATURE_GROUP_MATCHED in e.wraps()
+            ]
+            if not any(type(gate).on_run_start is not Extender.on_run_start for gate in gates):
+                raise GateBypassError(
+                    "The run identity differs from the plan identity and no never_fall_back extender "
+                    "overrides on_run_start to check it."
+                )
+        if self._plan_steps is None:
+            self._plan_steps = tuple(self.resolved_plan())
+        call_run_start_hook(self._extenders, run_context, plan, self._plan_steps)
+
+    def _complete_run(self, run_context: RunContext, outcome: LifecycleOutcome) -> None:
+        call_run_complete_hook(self._extenders, run_context, outcome)
+
+    def _stream_run_results(
+        self,
+        flight_server: Any | None,
+        parallelization_modes: set[ParallelizationMode],
+        api_data: dict[str, dict[str, Any]] | None,
+        artifacts: dict[str, Any] | None,
+        run_context: RunContext,
+        with_step_uuids: bool,
+    ) -> Generator[Any, None, None]:
+        """Deferred half of ``stream_run``: the priming yield separates run start from computation."""
+        outcome = LifecycleOutcome("succeeded")
+        try:
+            self.runner = None
+            self._start_run(run_context)
+            runner = self._setup_engine_runner(parallelization_modes, flight_server)
+            # Assigned before any yield so get_result()/get_artifacts() work after an early exit.
+            self.runner = runner
+            yield None
+            try:
+                self._enter_runner_context(
+                    runner,
+                    parallelization_modes,
+                    api_data,
+                    artifacts=artifacts,
+                    run_context=run_context,
+                )
+                with contextlib.closing(runner.compute_stream()) as stream:
+                    for step_uuid, result in stream:
+                        yield (step_uuid, result) if with_step_uuids else result
+            finally:
+                self._exit_runner_context(runner)
+        except GeneratorExit:
+            outcome = LifecycleOutcome("cancelled")
+            raise
+        except BaseException as error:
+            outcome = LifecycleOutcome("failed", type(error).__name__)
+            raise
+        finally:
+            self._complete_run(run_context, outcome)
+
+    def _batch_run(
+        self,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        flight_server: Any | None = None,
+        api_data: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
+    ) -> ExecutionOrchestrator:
+        """Sets up the engine runner and runs the engine computation."""
+        # Use stored api_data if not explicitly provided
+        _api_data = api_data if api_data is not None else self.api_data
+        if run_context is None:
+            run_context = self._build_run_context(None, None)
+        outcome = LifecycleOutcome("succeeded")
+        try:
+            self.runner = None
+            self._start_run(run_context)
+            runner = self._setup_engine_runner(parallelization_modes, flight_server)
+            # Assigned before computing so a failed run still exposes its runner, never a prior run's.
+            self.runner = runner
+            self._run_engine_computation(
+                runner,
+                parallelization_modes,
+                _api_data,
+                artifacts=artifacts,
+                run_context=run_context,
+            )
+            return runner
+        except BaseException as error:
+            outcome = LifecycleOutcome("failed", type(error).__name__)
+            raise
+        finally:
+            self._complete_run(run_context, outcome)
+
+    def _run_engine_computation(
+        self,
+        runner: ExecutionOrchestrator,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        api_data: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
+    ) -> None:
+        """Runs the engine computation within a context manager."""
+        if not isinstance(runner, ExecutionOrchestrator):
+            raise ValueError("Internal error: execution orchestrator not initialized. This is likely a bug in mloda.")
+
+        try:
+            self._enter_runner_context(
+                runner,
+                parallelization_modes,
+                api_data,
+                artifacts=artifacts,
+                run_context=run_context,
+            )
+            runner.compute()
+        finally:
+            self._exit_runner_context(runner)
+
+    def _enter_runner_context(
+        self,
+        runner: ExecutionOrchestrator,
+        parallelization_modes: set[ParallelizationMode],
+        api_data: dict[str, Any] | None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
+    ) -> None:
+        """Passes the runner the engine's prepare-time extender set."""
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        function_extender = self.engine.function_extender or None
+        if run_context is None:
+            run_context = self._build_run_context(None, None)
+        runner.__enter__(parallelization_modes, function_extender, api_data, artifacts, run_context)
+
+    def _exit_runner_context(self, runner: ExecutionOrchestrator) -> None:
+        """Exits the runner context."""
+        runner.__exit__(None, None, None)
+
+    def _create_engine(self) -> Engine:
+        engine = Engine(
+            self.features,
+            self.compute_framework,
+            self.links,
+            self.data_access_collection,
+            self.global_filter,
+            self.api_input_data_collection,
+            self.plugin_collector,
+            column_ordering=self.column_ordering,
+            function_extender=self._extenders,
+            plan_context=self.plan_context,
+            framework_preference=self.framework_preference,
+            output_framework=self.output_framework,
+        )
+        if not isinstance(engine, Engine):
+            raise ValueError("Engine initialization failed.")
+        return engine
+
+    def _setup_engine_runner(
+        self,
+        parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
+        flight_server: Any | None = None,
+    ) -> ExecutionOrchestrator:
+        """Sets up the engine runner based on parallelization mode."""
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+
+        runner = (
+            self.engine.compute(flight_server)
+            if ParallelizationMode.MULTIPROCESSING in parallelization_modes
+            else self.engine.compute()
+        )
+
+        if not isinstance(runner, ExecutionOrchestrator):
+            raise ValueError("ExecutionOrchestrator initialization failed.")
+
+        return runner
+
+    def get_result(self) -> list[Any]:
+        """Return the computed run results; raises if no run function has executed yet."""
+        if self.runner is None:
+            raise ValueError("You need to run any run function beforehand.")
+        return self.runner.get_result()
+
+    def get_artifacts(self) -> dict[str, Any]:
+        """Return the artifacts produced by the run; raises if no run function has executed yet."""
+        if self.runner is None:
+            raise ValueError("You need to run any run function beforehand.")
+        return self.runner.get_artifacts()
+
+    def _add_api_input_data(self, feature: Feature, api_input_data_collection: ApiInputDataCollection | None) -> None:
+        """Adds API input data to the feature options if available."""
+        if api_input_data_collection:
+            api_input_data_column_names = api_input_data_collection.get_column_names()
+            if len(api_input_data_column_names.data) == 0:
+                raise ValueError("No entry names found in ApiInputDataCollection.")
+            feature.options.add_to_group("ApiInputData", api_input_data_collection.get_column_names())

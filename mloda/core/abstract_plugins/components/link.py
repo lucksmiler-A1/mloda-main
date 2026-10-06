@@ -1,0 +1,628 @@
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError, dataclass
+from datetime import timedelta
+from enum import Enum
+from uuid import uuid4
+from typing import Any, ClassVar, Literal
+
+
+from mloda.core.abstract_plugins.components.hashable_dict import _deep_hashable
+from mloda.core.abstract_plugins.components.index.index import Index
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.components.validators.link_validator import LinkValidator
+
+
+class JoinType(Enum):
+    """
+    Enum defining types of dataset merge operations.
+
+    Attributes:
+        INNER: Includes rows with matching keys from both datasets.
+        LEFT: Includes all rows from the left dataset, with matches from the right.
+        RIGHT: Includes all rows from the right dataset, with matches from the left.
+        OUTER: Includes all rows from both datasets, filling unmatched values with nulls.
+        APPEND: Stacks datasets vertically, preserving all rows from both.
+        UNION: Combines datasets, removing duplicate rows.
+        ASOF: Per-row point-in-time / as-of join: equi match on the by-keys, nearest
+            time match (by direction) on the time columns.
+    """
+
+    INNER = "inner"
+    LEFT = "left"
+    RIGHT = "right"
+    OUTER = "outer"
+    APPEND = "append"
+    UNION = "union"
+    ASOF = "asof"
+
+
+@dataclass(frozen=True)
+class AsOfJoinConfig:
+    """Configuration for an ASOF (point-in-time) join.
+
+    The by-keys (the join Index) drive the equi match; the time columns drive the
+    inequality match. ``direction``/``tolerance``/``allow_exact_matches`` follow
+    pandas ``merge_asof`` semantics. ``coerce_time_columns`` opts in to ISO-8601
+    string coercion; the default keeps the strict error.
+    """
+
+    left_time_column: str
+    right_time_column: str
+    direction: Literal["backward", "forward", "nearest"] = "backward"
+    tolerance: float | int | timedelta | None = None
+    allow_exact_matches: bool = True
+    coerce_time_columns: bool = False
+
+    def __post_init__(self) -> None:
+        if self.direction not in ("backward", "forward", "nearest"):
+            raise ValueError(
+                f"Invalid asof direction {self.direction!r}; expected 'backward', 'forward', or 'nearest'."
+            )
+
+
+class JoinSpec:
+    """Specification for one side of a join operation.
+
+    Args:
+        feature_group: The feature group class for this side of the join.
+        index: Join column(s) - can be:
+            - str: single column name, e.g., "id"
+            - Tuple[str, ...]: multiple columns, e.g., ("col1", "col2")
+            - Index: explicit Index object
+    """
+
+    feature_group: type[Any]
+    index: Index
+
+    def __init__(self, feature_group: type[Any], index: Index | tuple[str, ...] | str) -> None:
+        """Create JoinSpec, converting index input to Index if needed."""
+        if isinstance(index, str):
+            LinkValidator.validate_index_not_empty(index, "Index column name")
+            index = Index((index,))
+        elif isinstance(index, tuple):
+            LinkValidator.validate_index_not_empty(index, "Index tuple")
+            index = Index(index)
+
+        object.__setattr__(self, "feature_group", feature_group)
+        object.__setattr__(self, "index", index)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise FrozenInstanceError(f"cannot assign to field '{name}'")
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, JoinSpec):
+            return False
+        return self.feature_group == other.feature_group and self.index == other.index
+
+    def __hash__(self) -> int:
+        return hash((self.feature_group, self.index))
+
+
+def _get_index_from_feature_group(
+    feature_group: type[Any],
+    index_position: int,
+    side_name: str,
+) -> Index:
+    """Extract Index from feature group's index_columns().
+
+    Args:
+        feature_group: The feature group class
+        index_position: Which index to use (0-based)
+        side_name: "left" or "right" for error messages
+
+    Returns:
+        The Index at the specified position
+
+    Raises:
+        ValueError: If index_columns() returns None or empty list
+        IndexError: If index_position is out of range
+    """
+    index_columns = feature_group.index_columns()
+
+    if index_columns is None:
+        raise ValueError(
+            f"{side_name.capitalize()} feature group {feature_group.__name__} does not define index_columns()"
+        )
+
+    if not index_columns:
+        raise ValueError(
+            f"{side_name.capitalize()} feature group {feature_group.__name__}.index_columns() returned empty list"
+        )
+
+    if index_position < 0 or index_position >= len(index_columns):
+        raise IndexError(
+            f"{side_name}_index {index_position} out of range for "
+            f"{feature_group.__name__} (has {len(index_columns)} indexes)"
+        )
+
+    result: Index = index_columns[index_position]
+    return result
+
+
+class Link:
+    """
+    Defines a join relationship between two feature groups.
+
+    Args:
+        jointype: Type of join operation (inner, left, right, outer, append, union).
+        left: JoinSpec for the left side of the join.
+        right: JoinSpec for the right side of the join.
+        left_discriminator: Optional dict to identify the left node when two nodes of the
+            same FeatureGroup class exist with different data sources (e.g. different CSV
+            files). Must match key-value pairs in the left feature's options.
+            Example: left_discriminator={"CsvReader": "application_train.csv"}
+        right_discriminator: Optional dict to identify the right node. Must match
+            key-value pairs in the right feature's options.
+
+    Factory Methods:
+        There are two styles of factory methods available:
+
+        **Standard methods** - require explicit JoinSpec objects:
+            - Link.inner(left_joinspec, right_joinspec)
+            - Link.left(left_joinspec, right_joinspec)
+            - Link.right(left_joinspec, right_joinspec)
+            - Link.outer(left_joinspec, right_joinspec)
+            - Link.append(left_joinspec, right_joinspec)
+            - Link.union(left_joinspec, right_joinspec)
+
+        **Convenience _on methods** - accept feature groups directly and derive
+        JoinSpecs automatically from index_columns():
+            - Link.inner_on(LeftFG, RightFG, left_index=0, right_index=0)
+            - Link.left_on(LeftFG, RightFG, left_index=0, right_index=0)
+            - Link.right_on(LeftFG, RightFG, left_index=0, right_index=0)
+            - Link.outer_on(LeftFG, RightFG, left_index=0, right_index=0)
+            - Link.append_on(LeftFG, RightFG, left_index=0, right_index=0)
+            - Link.union_on(LeftFG, RightFG, left_index=0, right_index=0)
+
+        The _on methods require feature groups to have index_columns() defined.
+        Use left_index/right_index to select which index when multiple are available.
+
+        **Star factory** - joins every spoke to a shared-index hub:
+            - Link.star(HubFG, SpokeAFG, SpokeBFG, index_column="row_id")
+            - Link.star(HubFG, SpokeAFG, index_column="row_id", jointype=JoinType.LEFT)
+
+        The first feature group is the hub; each remaining group is joined to it on the
+        shared index. The optional ``jointype`` (inner/left/outer, default inner) sets the
+        join type for every spoke. Returns a set of Links.
+
+        **ASOF factories** - point-in-time / as-of joins:
+            - Link.asof(left_joinspec, right_joinspec, left_time_column=..., right_time_column=...)
+            - Link.asof_on(LeftFG, RightFG, left_time_column=..., right_time_column=...)
+
+        For an ASOF join the by-keys are the ``Index`` (an equi match) and the time
+        columns drive the inequality match. ``direction`` ('backward', 'forward',
+        'nearest'), ``tolerance`` and ``allow_exact_matches`` follow pandas
+        ``merge_asof`` semantics and are carried on the link via an ``AsOfJoinConfig``.
+
+    Example:
+        >>> # Verbose: explicit JoinSpec with index
+        >>> Link.inner(JoinSpec(UserFG, "user_id"), JoinSpec(OrderFG, "user_id"))
+        >>>
+        >>> # Convenient: derive index from feature group's index_columns()
+        >>> Link.inner_on(UserFG, OrderFG)
+        >>>
+        >>> # Multi-index selection (use second index from left, first from right)
+        >>> Link.inner_on(UserFG, OrderFG, left_index=1, right_index=0)
+        >>>
+        >>> # Multi-column join using tuple index
+        >>> Link.inner(JoinSpec(UserFG, ("id", "date")), JoinSpec(OrderFG, ("user_id", "order_date")))
+        >>>
+        >>> # Same FeatureGroup class with different data sources (e.g. two CSV files):
+        >>> # Features must have the matching option key set at creation time.
+        >>> Link.inner(
+        ...     JoinSpec(ReadFileFeature, "id"),
+        ...     JoinSpec(ReadFileFeature, "id"),
+        ...     left_discriminator={"CsvReader": "application_train.csv"},
+        ...     right_discriminator={"CsvReader": "bureau.csv"},
+        ... )
+        >>>
+    Polymorphic Matching:
+        Links support inheritance-based matching, allowing a link defined with base
+        classes to automatically apply to subclasses. The matching follows these rules:
+
+        1. **Exact match first**: If a link's feature groups exactly match the classes
+           being joined, it takes priority over any polymorphic matches.
+
+        2. **Balanced inheritance**: For polymorphic matches, both sides must have the
+           same inheritance distance. This prevents sibling class mismatches.
+
+           Example - Given hierarchy:
+               BaseFeatureGroup
+               ├── ChildA
+               └── ChildB
+
+           Link(BaseFeatureGroup, BaseFeatureGroup) will match:
+           - (ChildA, ChildA) ✓  - both sides distance=1
+           - (ChildB, ChildB) ✓  - both sides distance=1
+           - (ChildA, ChildB) ✗  - rejected: siblings, not balanced inheritance
+
+        3. **Most specific wins**: Among valid matches, the link closest in the
+           inheritance hierarchy is selected.
+    """
+
+    # Join types Link.star supports: the hub anchors every spoke, so only these three apply.
+    _STAR_JOIN_TYPES: ClassVar[frozenset[JoinType]] = frozenset({JoinType.INNER, JoinType.LEFT, JoinType.OUTER})
+
+    def __init__(
+        self,
+        jointype: JoinType | str,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+        asof_config: AsOfJoinConfig | None = None,
+    ) -> None:
+        self.jointype = JoinType(jointype) if isinstance(jointype, str) else jointype
+        self.left_feature_group = left.feature_group
+        self.right_feature_group = right.feature_group
+        self.left_index = left.index
+        self.right_index = right.index
+        self.left_discriminator = left_discriminator
+        self.right_discriminator = right_discriminator
+        self.asof_config = asof_config
+
+        self.uuid = uuid4()
+
+    def __str__(self) -> str:
+        return f"{self.jointype.value} {self.left_feature_group.get_class_name()} {self.left_index} {self.right_feature_group.get_class_name()} {self.right_index} {self.uuid}"
+
+    @classmethod
+    def _from_specs(
+        cls,
+        jointype: JoinType,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None,
+        right_discriminator: dict[str, Any] | None,
+    ) -> "Link":
+        return cls(
+            jointype, left, right, left_discriminator=left_discriminator, right_discriminator=right_discriminator
+        )
+
+    @classmethod
+    def _from_feature_groups(
+        cls,
+        jointype: JoinType,
+        left: type[Any],
+        right: type[Any],
+        left_index: int,
+        right_index: int,
+        left_discriminator: dict[str, Any] | None,
+        right_discriminator: dict[str, Any] | None,
+    ) -> "Link":
+        left_idx = _get_index_from_feature_group(left, left_index, "left")
+        right_idx = _get_index_from_feature_group(right, right_index, "right")
+        return cls(
+            jointype,
+            JoinSpec(left, left_idx),
+            JoinSpec(right, right_idx),
+            left_discriminator=left_discriminator,
+            right_discriminator=right_discriminator,
+        )
+
+    @classmethod
+    def inner(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        return cls._from_specs(JoinType.INNER, left, right, left_discriminator, right_discriminator)
+
+    @classmethod
+    def left(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        return cls._from_specs(JoinType.LEFT, left, right, left_discriminator, right_discriminator)
+
+    @classmethod
+    def right(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        return cls._from_specs(JoinType.RIGHT, left, right, left_discriminator, right_discriminator)
+
+    @classmethod
+    def outer(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        return cls._from_specs(JoinType.OUTER, left, right, left_discriminator, right_discriminator)
+
+    @classmethod
+    def append(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        return cls._from_specs(JoinType.APPEND, left, right, left_discriminator, right_discriminator)
+
+    @classmethod
+    def union(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        return cls._from_specs(JoinType.UNION, left, right, left_discriminator, right_discriminator)
+
+    @classmethod
+    def inner_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create INNER join using feature groups' index_columns()."""
+        return cls._from_feature_groups(
+            JoinType.INNER, left, right, left_index, right_index, left_discriminator, right_discriminator
+        )
+
+    @classmethod
+    def star(
+        cls,
+        *feature_groups: type[Any],
+        index_column: Index | tuple[str, ...] | str,
+        jointype: JoinType | str = JoinType.INNER,
+    ) -> set["Link"]:
+        """Create links joining every spoke to a shared-index hub.
+
+        The first feature group is the hub; each remaining group is joined to it on the
+        shared index using ``jointype`` (default inner). Returns a set of Links (duplicate
+        spokes collapse in the set). ``jointype`` may be a ``JoinType`` or its string form
+        and must be one of inner, left, or outer; right/append/union are not supported for
+        star joins and asof needs ``Link.asof``.
+        Targets joins between distinct feature-group classes and does not support
+        left/right discriminators, so it cannot disambiguate multiple same-class nodes
+        (use ``Link.inner`` with discriminators for that). The hub class cannot also
+        appear as a spoke; spokes must be distinct classes from the hub.
+        """
+        if len(feature_groups) < 2:
+            raise ValueError("Link.star needs at least two feature groups: a hub plus at least one spoke.")
+
+        hub = feature_groups[0]
+        if any(spoke is hub for spoke in feature_groups[1:]):
+            raise ValueError(
+                "Link.star cannot join the hub feature group to itself: the hub class "
+                f"{hub.__name__} also appears as a spoke. Star joins target distinct feature-group classes."
+            )
+
+        jointype = JoinType(jointype) if isinstance(jointype, str) else jointype
+        if jointype not in cls._STAR_JOIN_TYPES:
+            raise ValueError(
+                f"Link.star supports only inner, left, or outer joins, got {getattr(jointype, 'value', jointype)}. "
+                "right/append/union are not supported for star joins; use Link.asof for asof joins."
+            )
+
+        # coerce/validate index_column (str/tuple/Index) into a shared Index reused on both sides
+        idx = JoinSpec(hub, index_column).index
+        return {cls(jointype, JoinSpec(hub, idx), JoinSpec(spoke, idx)) for spoke in feature_groups[1:]}
+
+    @classmethod
+    def left_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create LEFT join using feature groups' index_columns()."""
+        return cls._from_feature_groups(
+            JoinType.LEFT, left, right, left_index, right_index, left_discriminator, right_discriminator
+        )
+
+    @classmethod
+    def right_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create RIGHT join using feature groups' index_columns()."""
+        return cls._from_feature_groups(
+            JoinType.RIGHT, left, right, left_index, right_index, left_discriminator, right_discriminator
+        )
+
+    @classmethod
+    def outer_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create OUTER join using feature groups' index_columns()."""
+        return cls._from_feature_groups(
+            JoinType.OUTER, left, right, left_index, right_index, left_discriminator, right_discriminator
+        )
+
+    @classmethod
+    def append_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create APPEND join using feature groups' index_columns()."""
+        return cls._from_feature_groups(
+            JoinType.APPEND, left, right, left_index, right_index, left_discriminator, right_discriminator
+        )
+
+    @classmethod
+    def union_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create UNION join using feature groups' index_columns()."""
+        return cls._from_feature_groups(
+            JoinType.UNION, left, right, left_index, right_index, left_discriminator, right_discriminator
+        )
+
+    @classmethod
+    def asof(
+        cls,
+        left: JoinSpec,
+        right: JoinSpec,
+        *,
+        left_time_column: str,
+        right_time_column: str,
+        direction: Literal["backward", "forward", "nearest"] = "backward",
+        tolerance: float | int | timedelta | None = None,
+        allow_exact_matches: bool = True,
+        coerce_time_columns: bool = False,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create an ASOF (point-in-time) join from explicit JoinSpecs."""
+        config = AsOfJoinConfig(
+            left_time_column=left_time_column,
+            right_time_column=right_time_column,
+            direction=direction,
+            tolerance=tolerance,
+            allow_exact_matches=allow_exact_matches,
+            coerce_time_columns=coerce_time_columns,
+        )
+        return cls(
+            JoinType.ASOF,
+            left,
+            right,
+            left_discriminator=left_discriminator,
+            right_discriminator=right_discriminator,
+            asof_config=config,
+        )
+
+    @classmethod
+    def asof_on(
+        cls,
+        left: type[Any],
+        right: type[Any],
+        *,
+        left_time_column: str,
+        right_time_column: str,
+        direction: Literal["backward", "forward", "nearest"] = "backward",
+        tolerance: float | int | timedelta | None = None,
+        allow_exact_matches: bool = True,
+        coerce_time_columns: bool = False,
+        left_index: int = 0,
+        right_index: int = 0,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+    ) -> "Link":
+        """Create an ASOF join, deriving the by-key Index from index_columns()."""
+        left_idx = _get_index_from_feature_group(left, left_index, "left")
+        right_idx = _get_index_from_feature_group(right, right_index, "right")
+        config = AsOfJoinConfig(
+            left_time_column=left_time_column,
+            right_time_column=right_time_column,
+            direction=direction,
+            tolerance=tolerance,
+            allow_exact_matches=allow_exact_matches,
+            coerce_time_columns=coerce_time_columns,
+        )
+        return cls(
+            JoinType.ASOF,
+            JoinSpec(left, left_idx),
+            JoinSpec(right, right_idx),
+            left_discriminator=left_discriminator,
+            right_discriminator=right_discriminator,
+            asof_config=config,
+        )
+
+    def matches_exact(
+        self,
+        other_left_feature_group: type[Any],
+        other_right_feature_group: type[Any],
+    ) -> bool:
+        """Exact class identity match only."""
+        left_match: bool = self.left_feature_group is other_left_feature_group
+        right_match: bool = self.right_feature_group is other_right_feature_group
+        return left_match and right_match
+
+    def matches_polymorphic(
+        self,
+        other_left_feature_group: type[Any],
+        other_right_feature_group: type[Any],
+    ) -> bool:
+        """Subclass match (inheritance). Returns True if both sides are subclasses."""
+        return issubclass(other_left_feature_group, self.left_feature_group) and issubclass(
+            other_right_feature_group, self.right_feature_group
+        )
+
+    def matches(
+        self,
+        other_left_feature_group: type[Any],
+        other_right_feature_group: type[Any],
+    ) -> bool:
+        """Combined match: exact OR polymorphic."""
+        return self.matches_exact(other_left_feature_group, other_right_feature_group) or self.matches_polymorphic(
+            other_left_feature_group, other_right_feature_group
+        )
+
+    @staticmethod
+    def matches_discriminator(discriminator: dict[str, Any], options: Options) -> bool:
+        """Whether every discriminator key-value pair is present and equal in options."""
+        for dk, dv in discriminator.items():
+            if dk not in options or options.get(dk) != dv:
+                return False
+        return True
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Link):
+            return False
+        return (
+            self.jointype == other.jointype
+            and self.left_feature_group.get_class_name() == other.left_feature_group.get_class_name()
+            and self.right_feature_group.get_class_name() == other.right_feature_group.get_class_name()
+            and self.left_index == other.left_index
+            and self.right_index == other.right_index
+            and self.asof_config == other.asof_config
+            and self.left_discriminator == other.left_discriminator
+            and self.right_discriminator == other.right_discriminator
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.jointype,
+                self.left_feature_group.get_class_name(),
+                self.right_feature_group.get_class_name(),
+                self.left_index,
+                self.right_index,
+                self.asof_config,
+                _deep_hashable(self.left_discriminator),
+                _deep_hashable(self.right_discriminator),
+            )
+        )

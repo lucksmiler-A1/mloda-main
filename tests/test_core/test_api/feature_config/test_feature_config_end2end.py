@@ -1,0 +1,547 @@
+import json
+from pathlib import Path
+from typing import Any
+from mloda.provider import DefaultOptionKeys
+import pytest
+from mloda.user import mloda
+from mloda.user import Feature
+from mloda.user import PluginCollector
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda.core.api.feature_config.loader import load_features_from_config
+from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
+
+
+def test_end2end_feature_config() -> None:
+    """Test that feature config loader correctly parses config and creates Feature objects."""
+    config_str = json.dumps(["age", {"name": "weight", "options": {"imputation_method": "mean"}}])
+
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got 2 features
+    assert len(features) == 2
+
+    # First feature: simple string "age"
+    assert features[0] == "age"
+
+    # Second feature: Feature object with name and options
+    assert isinstance(features[1], Feature)
+    assert features[1].name == "weight"
+    assert features[1].options.get("imputation_method") == "mean"
+
+
+def test_integration_json_file() -> None:
+    """Test loading and validating the integration JSON file with all features including references."""
+    # Load the integration JSON file
+    json_path = Path(__file__).parent / "test_config_features.json"
+    with open(json_path) as f:
+        config_str = f.read()
+
+    # Parse the features
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got 15 features (including 2 multi-source features, 1 nested feature, and 3 multi-column features)
+    assert len(features) == 15
+
+    # First feature: simple string "age"
+    assert features[0] == "age"
+
+    # Second feature: Feature object with name and options
+    assert isinstance(features[1], Feature)
+    assert features[1].name == "weight"
+    assert features[1].options.get("imputation_method") == "mean"
+
+    # Third feature: Chained feature (source inferred from name)
+    assert isinstance(features[2], Feature)
+    assert features[2].name == "age__mean_imputed__standard_scaled"
+    # No explicit mloda_source - will be inferred from name as "age__mean_imputed"
+
+    # Fourth feature: Chained feature (source inferred from name)
+    assert isinstance(features[3], Feature)
+    assert features[3].name == "weight__mean_imputed__max_aggr"
+    # No explicit mloda_source - will be inferred from name as "weight__mean_imputed"
+
+    # Fifth feature: Chained feature with options (source inferred from name)
+    assert isinstance(features[4], Feature)
+    assert features[4].name == "weight__mean_imputed__min_aggr"
+    # No explicit mloda_source - will be inferred from name as "weight__mean_imputed"
+    # Verify timewindow option is in group options
+    assert features[4].options.group.get("timewindow") == 3
+
+    # Sixth feature: Feature with column_index (column selector)
+    assert isinstance(features[5], Feature)
+    assert features[5].name == "state__onehot_encoded~0"
+
+    # Seventh feature: Feature with column_index (column selector)
+    assert isinstance(features[6], Feature)
+    assert features[6].name == "state__onehot_encoded~1"
+
+    # Eighth feature: minmaxscaledage with mloda_source "age"
+    assert isinstance(features[7], Feature)
+    assert features[7].name == "minmaxscaledage"
+    assert features[7].options.group.get("in_features") == "age"
+    assert features[7].options.group.get("scaler_type") == "minmax"
+
+    # Ninth feature: age__max_aggr with in_features=["age"] (the name's direct source)
+    assert isinstance(features[8], Feature)
+    assert features[8].name == "age__max_aggr"
+    mloda_source_8 = features[8].options.context.get("in_features")
+    assert mloda_source_8 == ("age",)
+
+    # Tenth feature: min_max with in_features="age__max_aggr" in options
+    assert isinstance(features[9], Feature)
+    assert features[9].name == "min_max"
+    # The in_features should be in group options
+    mloda_source_9 = features[9].options.group.get("in_features")
+    assert mloda_source_9 == "age__max_aggr"
+    assert features[9].options.group.get("scaler_type") == "minmax"
+
+    # Eleventh feature: customer_location&store_location__haversine_distance (geo distance feature)
+    assert isinstance(features[10], Feature)
+    assert features[10].name == "customer_location&store_location__haversine_distance"
+
+    # Twelfth feature: custom_geo_distance with in_features (multiple sources)
+    assert isinstance(features[11], Feature)
+    assert features[11].name == "custom_geo_distance"
+    # Verify in_features is converted to tuple and stored correctly
+    in_features_11 = features[11].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features_11, tuple)
+    assert in_features_11 == ("customer_location", "store_location")
+    assert features[11].options.context.get("distance_type") == "euclidean"
+
+
+class ChainedFeatureTestDataCreator(ATestDataCreator):
+    """Test data creator for end-to-end chained feature tests."""
+
+    compute_framework = PandasDataFrame
+
+    @classmethod
+    def get_raw_data(cls) -> dict[str, Any]:
+        """Return the raw data as a dictionary."""
+        return {
+            "age": [25, 30, 35, 40, 45],
+            "salary": [50000, 60000, 70000, 80000, 90000],
+        }
+
+
+def test_end2end_chained_features() -> None:
+    """Test that chained features work with mloda.run_all in a real scenario."""
+    # Skip test if sklearn not available (needed for scaling)
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        pytest.skip("scikit-learn not available")
+
+    # Import sklearn feature groups needed for chained features
+    from mloda_plugins.feature_group.experimental.sklearn.scaling.pandas import PandasScalingFeatureGroup
+    from mloda_plugins.feature_group.experimental.data_quality.missing_value.pandas import (
+        PandasMissingValueFeatureGroup,
+    )
+
+    # Create a JSON config with chained features
+    config_str = json.dumps(
+        [
+            "age",
+            "salary",
+            {
+                "name": "age__mean_imputed",
+                "in_features": ["age"],
+            },
+            {
+                "name": "age__mean_imputed__standard_scaled",
+                "in_features": ["age__mean_imputed"],
+            },
+        ]
+    )
+
+    # Parse the features from config
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got 4 features
+    assert len(features) == 4
+
+    # Enable the necessary feature groups
+    plugin_collector = PluginCollector.enabled_feature_groups(
+        {ChainedFeatureTestDataCreator, PandasScalingFeatureGroup, PandasMissingValueFeatureGroup}
+    )
+
+    # Run mloda with the features
+    results = mloda.run_all(
+        features,
+        compute_frameworks=[PandasDataFrame],
+        plugin_collector=plugin_collector,
+    )
+
+    # Verify results
+    assert len(results) > 0, "Expected at least one result DataFrame"
+
+    # Find the DataFrame with all features
+    result_df = None
+    for df in results:
+        if "age__mean_imputed__standard_scaled" in df.columns:
+            result_df = df
+            break
+
+    assert result_df is not None, "DataFrame with chained feature not found"
+
+    # Verify the chained feature exists
+    assert "age__mean_imputed__standard_scaled" in result_df.columns
+
+    # Verify the chained feature has values (basic sanity check)
+    assert len(result_df["age__mean_imputed__standard_scaled"]) == 5
+    assert not result_df["age__mean_imputed__standard_scaled"].isna().any()
+
+
+def test_end2end_chained_name_with_root_in_features_names_the_direct_sources() -> None:
+    """A chained name with the root source as in_features contradicts the name; the error names the direct sources."""
+    pytest.importorskip("sklearn")
+    from mloda_plugins.feature_group.experimental.sklearn.scaling.pandas import PandasScalingFeatureGroup
+    from mloda_plugins.feature_group.experimental.data_quality.missing_value.pandas import (
+        PandasMissingValueFeatureGroup,
+    )
+
+    config_str = json.dumps(
+        [
+            "age",
+            {"name": "age__mean_imputed", "in_features": ["age"]},
+            {"name": "age__mean_imputed__standard_scaled", "in_features": ["age"]},
+        ]
+    )
+    features = load_features_from_config(config_str, format="json")
+    plugin_collector = PluginCollector.enabled_feature_groups(
+        {ChainedFeatureTestDataCreator, PandasScalingFeatureGroup, PandasMissingValueFeatureGroup}
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        mloda.run_all(features, compute_frameworks=[PandasDataFrame], plugin_collector=plugin_collector)
+
+    assert "direct source" in str(exc_info.value)
+
+
+def test_end2end_group_context_options() -> None:
+    """Test that features with group_options and context_options are correctly parsed and loaded."""
+    # Create a JSON config with group_options and context_options
+    config_str = json.dumps(
+        [
+            {
+                "name": "feature_with_separation",
+                "group_options": {"data_source": "production", "cache_enabled": True},
+                "context_options": {"aggregation_type": "sum", "window_size": 7, "normalization": "zscore"},
+            }
+        ]
+    )
+
+    # Parse the features from config
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got 1 feature
+    assert len(features) == 1
+
+    # Verify the feature is a Feature object
+    assert isinstance(features[0], Feature)
+    assert features[0].name == "feature_with_separation"
+
+    # Verify group options are correctly set
+    assert features[0].options.group.get("data_source") == "production"
+    assert features[0].options.group.get("cache_enabled") is True
+
+    # Verify context options are correctly set
+    assert features[0].options.context.get("aggregation_type") == "sum"
+    assert features[0].options.context.get("window_size") == 7
+    assert features[0].options.context.get("normalization") == "zscore"
+
+
+def test_end2end_multi_column_access() -> None:
+    """Test that column_index features work with mloda.run_all in a real scenario."""
+    # Skip test if sklearn not available (needed for one-hot encoding)
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        pytest.skip("scikit-learn not available")
+
+    # Import sklearn feature groups needed for one-hot encoding
+    from mloda_plugins.feature_group.experimental.sklearn.encoding.pandas import PandasEncodingFeatureGroup
+
+    # Create a JSON config with column_index features
+    config_str = json.dumps(
+        [
+            "state",
+            {
+                "name": "state__onehot_encoded",
+                "in_features": ["state"],
+            },
+            {
+                "name": "state__onehot_encoded",
+                "column_index": 0,
+            },
+            {
+                "name": "state__onehot_encoded",
+                "column_index": 1,
+            },
+        ]
+    )
+
+    # Parse the features from config
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got 4 features
+    assert len(features) == 4
+
+    # Verify the column selector features have the tilde syntax in their names
+    assert isinstance(features[2], Feature)
+    assert isinstance(features[3], Feature)
+    assert features[2].name == "state__onehot_encoded~0"
+    assert features[3].name == "state__onehot_encoded~1"
+
+    # Create a test data creator for state data
+    class StateTestDataCreator(ATestDataCreator):
+        """Test data creator for state column selector tests."""
+
+        compute_framework = PandasDataFrame
+
+        @classmethod
+        def get_raw_data(cls) -> dict[str, Any]:
+            """Return the raw data as a dictionary."""
+            return {
+                "state": ["CA", "NY", "CA", "TX", "NY"],
+            }
+
+    # Enable the necessary feature groups
+    plugin_collector = PluginCollector.enabled_feature_groups({StateTestDataCreator, PandasEncodingFeatureGroup})
+
+    # Run mloda with the features
+    results = mloda.run_all(
+        features,
+        compute_frameworks=[PandasDataFrame],
+        plugin_collector=plugin_collector,
+    )
+
+    # Verify results
+    assert len(results) > 0, "Expected at least one result DataFrame"
+
+    # Find the DataFrame with all features
+    result_df = None
+    for df in results:
+        if "state__onehot_encoded~0" in df.columns and "state__onehot_encoded~1" in df.columns:
+            result_df = df
+            break
+
+    assert result_df is not None, "DataFrame with column selector features not found"
+
+    # Verify the column selector features exist
+    assert "state__onehot_encoded~0" in result_df.columns
+    assert "state__onehot_encoded~1" in result_df.columns
+
+    # Verify the column selector features have values (basic sanity check)
+    assert len(result_df["state__onehot_encoded~0"]) == 5
+    assert len(result_df["state__onehot_encoded~1"]) == 5
+
+    # Verify they are different columns (one-hot encoded should have different values)
+    assert not (result_df["state__onehot_encoded~0"] == result_df["state__onehot_encoded~1"]).all()
+
+
+def test_end2end_multiple_source_features() -> None:
+    """Test that features with in_features (multiple sources) are correctly parsed and loaded."""
+    # Create a JSON config with multiple source features
+    config_str = json.dumps(
+        [
+            "latitude",
+            "longitude",
+            "sales",
+            "revenue",
+            "profit",
+            {
+                "name": "distance_feature",
+                "in_features": ["latitude", "longitude"],
+                "options": {"distance_type": "euclidean"},
+            },
+            {
+                "name": "multi_source_aggregation",
+                "in_features": ["sales", "revenue", "profit"],
+                "options": {"aggregation": "sum"},
+            },
+            {
+                "name": "feature_with_both",
+                "in_features": ["latitude", "longitude"],
+                "group_options": {"cache_enabled": True},
+                "context_options": {"precision": 6},
+            },
+        ]
+    )
+
+    # Parse the features from config
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got 8 features
+    assert len(features) == 8
+
+    # First three features: simple strings
+    assert features[0] == "latitude"
+    assert features[1] == "longitude"
+    assert features[2] == "sales"
+    assert features[3] == "revenue"
+    assert features[4] == "profit"
+
+    # Sixth feature: distance_feature with in_features
+    assert isinstance(features[5], Feature)
+    assert features[5].name == "distance_feature"
+    # Verify in_features is converted to tuple
+    in_features_5 = features[5].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features_5, tuple)
+    assert in_features_5 == ("latitude", "longitude")
+    # Verify options are correctly set
+    assert features[5].options.group.get("distance_type") == "euclidean"
+
+    # Seventh feature: multi_source_aggregation with in_features
+    assert isinstance(features[6], Feature)
+    assert features[6].name == "multi_source_aggregation"
+    # Verify in_features is converted to tuple
+    in_features_6 = features[6].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features_6, tuple)
+    assert in_features_6 == ("sales", "revenue", "profit")
+    # Verify options are correctly set
+    assert features[6].options.group.get("aggregation") == "sum"
+
+    # Eighth feature: feature_with_both (in_features with group_options and context_options)
+    assert isinstance(features[7], Feature)
+    assert features[7].name == "feature_with_both"
+    # Verify in_features is converted to tuple
+    in_features_7 = features[7].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features_7, tuple)
+    assert in_features_7 == ("latitude", "longitude")
+    # Verify group options are correctly set
+    assert features[7].options.group.get("cache_enabled") is True
+    # Verify context options are correctly set (in addition to in_features)
+    assert features[7].options.context.get("precision") == 6
+
+
+def test_complete_integration_json() -> None:
+    """Comprehensive test that validates ALL feature types are present in the integration JSON file.
+
+    This test ensures the test_config_features.json file includes all supported feature patterns:
+    - Simple string features
+    - Features with options
+    - Chained features (with __)
+    - Group/context options separation
+    - Multi-column access (column_index)
+    - Feature references (@syntax)
+    - Multiple source features (in_features)
+    """
+    # Load the integration JSON file
+    json_path = Path(__file__).parent / "test_config_features.json"
+    with open(json_path) as f:
+        config_str = f.read()
+
+    # Parse all features using load_features_from_config
+    features = load_features_from_config(config_str, format="json")
+
+    # Verify we got the expected number of features (15 total, including nested feature and multi-column features)
+    assert len(features) == 15, f"Expected 15 features, got {len(features)}"
+
+    # Track which feature types we've validated
+    validated_patterns = {
+        "simple_string": False,
+        "feature_with_options": False,
+        "chained_feature": False,
+        "group_context_separation": False,
+        "column_selector": False,
+        "feature_reference": False,
+        "multiple_sources": False,
+    }
+
+    # 1. Simple string features
+    # Feature index 0: "age"
+    assert features[0] == "age", "Simple string feature 'age' not found"
+    validated_patterns["simple_string"] = True
+
+    # 2. Features with options
+    # Feature index 1: weight with imputation_method option
+    assert isinstance(features[1], Feature), "Feature 'weight' should be a Feature object"
+    assert features[1].name == "weight", "Feature name should be 'weight'"
+    assert features[1].options.get("imputation_method") == "mean", "imputation_method should be 'mean'"
+    validated_patterns["feature_with_options"] = True
+
+    # 3. Chained features (with __ in name, source inferred from name)
+    # Feature index 2: age__mean_imputed__standard_scaled
+    assert isinstance(features[2], Feature), "Chained feature should be a Feature object"
+    assert features[2].name == "age__mean_imputed__standard_scaled", "Chained feature name incorrect"
+    # No explicit mloda_source - will be inferred from name as "age__mean_imputed"
+    validated_patterns["chained_feature"] = True
+
+    # Feature index 3: Another chained feature (aggregation on mean imputation)
+    assert isinstance(features[3], Feature), "Second chained feature should be a Feature object"
+    assert features[3].name == "weight__mean_imputed__max_aggr", "Second chained feature name incorrect"
+    # No explicit mloda_source - will be inferred from name as "weight__mean_imputed"
+
+    # 4. Group/context options separation
+    # Feature index 4: weight__mean_imputed__min_aggr with options (source inferred from name)
+    assert isinstance(features[4], Feature), "Feature with group/context options should be a Feature object"
+    assert features[4].name == "weight__mean_imputed__min_aggr", (
+        "Feature name should be 'weight__mean_imputed__min_aggr'"
+    )
+    # No explicit mloda_source - will be inferred from name as "weight__mean_imputed"
+    assert features[4].options.group.get("timewindow") == 3, "group option 'timewindow' should be 3"
+    validated_patterns["group_context_separation"] = True
+
+    # 5. Multi-column access (column_index with ~ syntax)
+    # Feature index 5: state__onehot_encoded~0
+    assert isinstance(features[5], Feature), "Column selector feature should be a Feature object"
+    assert features[5].name == "state__onehot_encoded~0", "Column selector feature should have ~0 suffix"
+    validated_patterns["column_selector"] = True
+
+    # Feature index 6: state__onehot_encoded~1
+    assert isinstance(features[6], Feature), "Second column selector feature should be a Feature object"
+    assert features[6].name == "state__onehot_encoded~1", "Second column selector should have ~1 suffix"
+
+    # 6. Feature references (@syntax)
+    # Feature index 7: minmaxscaledage (base feature)
+    assert isinstance(features[7], Feature), "Base feature for reference should be a Feature object"
+    assert features[7].name == "minmaxscaledage", "Base feature name should be 'minmaxscaledage'"
+    assert features[7].options.group.get("in_features") == "age", "Base feature mloda_source should be 'age'"
+
+    # Feature index 8: age__max_aggr with in_features=["age"]
+    assert isinstance(features[8], Feature), "Feature with aggregation should be a Feature object"
+    assert features[8].name == "age__max_aggr", "Feature name should be 'age__max_aggr'"
+    mloda_source_8 = features[8].options.context.get("in_features")
+    assert mloda_source_8 == ("age",), "in_features should be tuple with 'age'"
+    validated_patterns["feature_reference"] = True
+
+    # Feature index 9: min_max with in_features="age__max_aggr" in options
+    assert isinstance(features[9], Feature), "Feature with scaling should be a Feature object"
+    assert features[9].name == "min_max", "Feature name should be 'min_max'"
+    mloda_source_9 = features[9].options.group.get("in_features")
+    assert mloda_source_9 == "age__max_aggr", "in_features should be 'age__max_aggr'"
+    assert features[9].options.group.get("scaler_type") == "minmax", "scaler_type should be 'minmax'"
+
+    # 7. Geo distance feature (string-based naming pattern)
+    # Feature index 10: customer_location&store_location__haversine_distance
+    assert isinstance(features[10], Feature), "Geo distance feature should be a Feature object"
+    assert features[10].name == "customer_location&store_location__haversine_distance", (
+        "Feature name should be 'customer_location&store_location__haversine_distance'"
+    )
+    # The string-based geo distance feature uses the pattern: {point1}&{point2}__{distance_type}_distance
+    # No in_features or options needed - it's all encoded in the feature name
+    validated_patterns["multiple_sources"] = True
+
+    # Feature index 11: custom_geo_distance with in_features ["customer_location", "store_location"]
+    assert isinstance(features[11], Feature), "Second multi-source feature should be a Feature object"
+    assert features[11].name == "custom_geo_distance", "Feature name should be 'custom_geo_distance'"
+    in_features_11 = features[11].options.context.get(DefaultOptionKeys.in_features)
+    assert isinstance(in_features_11, tuple), "in_features should be converted to tuple"
+    assert in_features_11 == ("customer_location", "store_location"), (
+        "in_features should contain customer_location and store_location"
+    )
+    assert features[11].options.context.get("distance_type") == "euclidean", "distance_type should be 'euclidean'"
+
+    # Final validation: Ensure ALL pattern types are validated
+    missing_patterns = [pattern for pattern, validated in validated_patterns.items() if not validated]
+    assert not missing_patterns, f"Missing validation for pattern types: {missing_patterns}"
+
+    # Summary: All feature pattern types are present and correctly parsed
+    print("All feature pattern types validated successfully:")
+    print("  - Simple string features")
+    print("  - Features with options")
+    print("  - Chained features (with __)")
+    print("  - Group/context options separation")
+    print("  - Multi-column access (column_index)")
+    print("  - Feature references (@syntax)")
+    print("  - Multiple source features (in_features)")

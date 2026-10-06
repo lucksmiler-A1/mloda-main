@@ -1,0 +1,871 @@
+"""Structured parsed-name bindings for PROPERTY_MAPPING (issue #770).
+
+``parse_name`` returns the parse as FACTS (``ParsedFeatureName``), and ``bind_name_captures`` turns those
+facts into PROPERTY_MAPPING bindings by NAME instead of by a reverse allowed_values lookup. That makes a
+secondary capture and an element_validator-only spec reachable from the feature name.
+
+All fixture names carry a "pnb770" marker so they cannot collide with other tests in the global registry.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import re
+from typing import Any
+
+import pytest
+
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import (
+    FeatureChainParser,
+    PropertyValueRejection,
+)
+from mloda.core.abstract_plugins.components.match_rejection import MatchRejection
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import FeatureChainParserMixin
+from mloda.core.abstract_plugins.components.feature_chainer import parsed_feature_name
+from mloda.core.abstract_plugins.components.feature_chainer.parsed_feature_name import ParsedFeatureName
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.options import Options
+from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.provider import PropertySpec
+from mloda_plugins.feature_group.experimental.aggregated_feature_group.base import AggregatedFeatureGroup
+from mloda_plugins.feature_group.experimental.sklearn.scaling.base import ScalingFeatureGroup
+from mloda_plugins.feature_group.experimental.text_cleaning.base import TextCleaningFeatureGroup
+
+
+ALGORITHM_KEY = "algorithm_pnb770"
+SIZE_KEY = "size_pnb770"
+SOLVER_KEY = "solver_pnb770"
+NOTES_KEY = "notes_pnb770"
+
+ALGORITHMS = {"pca": "PCA", "tsne": "t-SNE"}
+
+
+def _is_digit_string(value: Any) -> bool:
+    """Accept a non-empty digit string, the shape a regex capture yields."""
+    return isinstance(value, str) and value.isdigit()
+
+
+def _rejects_tsne(value: Any) -> bool:
+    """match_guard: everything but tsne passes."""
+    return bool(value != "tsne")
+
+
+def _needs_notes(options: Options) -> bool:
+    """required_when: notes is required once the name carries size 3."""
+    return bool(options.get(SIZE_KEY) == "3")
+
+
+def _algorithm_spec(**overrides: Any) -> PropertySpec:
+    """A strict allowed_values spec for the algorithm key."""
+    kwargs: dict[str, Any] = {
+        "allowed_values": ALGORITHMS,
+        "context": True,
+        "strict_validation": True,
+    }
+    kwargs.update(overrides)
+    return PropertySpec("Algorithm of the pnb770 fixture", **kwargs)
+
+
+def _size_spec() -> PropertySpec:
+    """An element_validator-only spec: it declares NO allowed_values, so no reverse lookup can reach it."""
+    return PropertySpec(
+        "Size of the pnb770 fixture",
+        context=True,
+        strict_validation=True,
+        element_validator=_is_digit_string,
+    )
+
+
+class NamedCaptureGroup(FeatureChainParserMixin):
+    """Two named captures: algorithm has a value space, size has only an element_validator."""
+
+    PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>pca|tsne)_(?P<{SIZE_KEY}>\d+)d_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {
+        ALGORITHM_KEY: _algorithm_spec(),
+        SIZE_KEY: _size_spec(),
+    }
+
+
+class OptionalCaptureGroup(FeatureChainParserMixin):
+    """The size group is optional, so it may not participate in a match."""
+
+    PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>pca|tsne)(?:_(?P<{SIZE_KEY}>\d+)d)?_optional_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {
+        ALGORITHM_KEY: _algorithm_spec(),
+        SIZE_KEY: _size_spec(),
+    }
+
+
+class UnmappedNamedCaptureGroup(FeatureChainParserMixin):
+    """A named capture that is no mapping key, whose VALUE would satisfy the legacy reverse lookup."""
+
+    PREFIX_PATTERN = r".*__(?P<unmapped_pnb770>pca|tsne)_unmapped_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {ALGORITHM_KEY: _algorithm_spec()}
+
+
+class LegacyPositionalGroup(FeatureChainParserMixin):
+    """No named capture at all: the legacy allowed_values fallback still binds group 1."""
+
+    PREFIX_PATTERN = r".*__(pca|tsne)_legacy_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {
+        ALGORITHM_KEY: _algorithm_spec(),
+        NOTES_KEY: PropertySpec("Free text, no value space", context=True, strict_validation=False, default=""),
+    }
+
+
+class RequiredWhenNamedGroup(FeatureChainParserMixin):
+    """The SECONDARY capture drives a required_when predicate."""
+
+    PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>pca|tsne)_(?P<{SIZE_KEY}>\d+)d_reqwhen_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {
+        ALGORITHM_KEY: _algorithm_spec(),
+        SIZE_KEY: _size_spec(),
+        NOTES_KEY: PropertySpec("Notes", context=True, strict_validation=False, required_when=_needs_notes),
+    }
+
+
+class GuardedNamedGroup(FeatureChainParserMixin):
+    """A match_guard on a key the feature name carries."""
+
+    PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>pca|tsne)_guard_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {
+        ALGORITHM_KEY: _algorithm_spec(strict_validation=False, match_guard=_rejects_tsne)
+    }
+
+
+class StrictNamedGroup(FeatureChainParserMixin):
+    """The capture is wider than the value space, so the name can carry a rejected value."""
+
+    PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>\w+)_strict_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {ALGORITHM_KEY: _algorithm_spec()}
+
+
+class ForwardedSecondaryGroup(FeatureChainParserMixin):
+    """Both keys are group-categorized (context=False): only group options flow through forwarding."""
+
+    PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>pca|tsne)_(?P<{SOLVER_KEY}>auto|arpack)_fwd_pnb770$"
+
+    PROPERTY_MAPPING: dict[str, PropertySpec] = {
+        ALGORITHM_KEY: _algorithm_spec(context=False),
+        SOLVER_KEY: PropertySpec(
+            "Solver of the pnb770 fixture",
+            allowed_values={"auto": "Auto", "arpack": "ARPACK"},
+            context=False,
+            strict_validation=True,
+        ),
+    }
+
+
+FORWARDED_FEATURE_NAME = "sales__pca_auto_fwd_pnb770"
+
+
+def _inherited_child_options(consumer_group: dict[str, Any]) -> Options:
+    """Build child options exactly like the engine does: inherit_from the consumer."""
+    child_options = Options()
+    child_options.inherit_from(Options(group=consumer_group))
+    return child_options
+
+
+class TestParsedFeatureNameShape:
+    """The parse result is a frozen record of facts, mirroring what ``re`` reports."""
+
+    def test_fields_carry_the_parse(self) -> None:
+        """matched, source_feature, operation_part, named_captures and positional_captures are the shape."""
+        parsed = FeatureChainParser.parse_name("f0__pca_2d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN])
+
+        assert parsed.matched is True
+        assert parsed.source_feature == "f0"
+        assert parsed.operation_part == "pca_2d_pnb770"
+        assert parsed.named_captures == {ALGORITHM_KEY: "pca", SIZE_KEY: "2"}
+        assert parsed.positional_captures == ("pca", "2")
+
+    def test_result_is_frozen(self) -> None:
+        """The parse is a fact, so it cannot be rewritten after the fact."""
+        parsed = ParsedFeatureName(matched=True, source_feature="f0", operation_part="pca_2d_pnb770")
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(parsed, "matched", False)
+
+    def test_defaults_describe_a_captureless_miss(self) -> None:
+        """Only ``matched`` has no default; everything else defaults to empty."""
+        parsed = ParsedFeatureName(matched=False)
+
+        assert parsed.source_feature is None
+        assert parsed.operation_part is None
+        assert parsed.named_captures == {}
+        assert parsed.positional_captures == ()
+
+    def test_named_capture_appears_in_both_capture_views(self) -> None:
+        """A named group is reported by name AND by position, exactly as ``re`` does."""
+        pattern = NamedCaptureGroup.PREFIX_PATTERN
+        parsed = FeatureChainParser.parse_name("f0__tsne_7d_pnb770", [pattern])
+        match = re.match(pattern, "f0__tsne_7d_pnb770")
+
+        assert match is not None
+        assert parsed.named_captures == match.groupdict()
+        assert parsed.positional_captures == match.groups()
+
+    def test_non_participating_optional_group_is_none_in_both_views(self) -> None:
+        """An optional group that did not participate is None by name and by position."""
+        parsed = FeatureChainParser.parse_name("f0__pca_optional_pnb770", [OptionalCaptureGroup.PREFIX_PATTERN])
+
+        assert parsed.matched is True
+        assert parsed.named_captures == {ALGORITHM_KEY: "pca", SIZE_KEY: None}
+        assert parsed.positional_captures == ("pca", None)
+
+
+class TestParseName:
+    """parse_name keeps today's matching semantics and fabricates nothing."""
+
+    def test_trailing_newline_is_a_miss(self) -> None:
+        """A `$`-terminated pattern must not match a name with a trailing newline."""
+        pattern = r".*__(?P<algorithm>[\w]+)_(?P<dimension>\d+)d$"
+
+        assert FeatureChainParser.parse_name("x__pca_2d\n", [pattern]).matched is False
+
+    def test_extract_in_feature_rejects_a_trailing_newline(self) -> None:
+        """extract_in_feature raises for a name with a trailing newline."""
+        pattern = r".*__(?P<algorithm>[\w]+)_(?P<dimension>\d+)d$"
+
+        with pytest.raises(ValueError):
+            FeatureChainParser.extract_in_feature("x__pca_2d\n", pattern)
+
+    def test_no_pattern_match_is_a_miss(self) -> None:
+        """A name no pattern matches yields matched=False and no facts."""
+        parsed = FeatureChainParser.parse_name("unrelated_pnb770", [NamedCaptureGroup.PREFIX_PATTERN])
+
+        assert parsed.matched is False
+        assert parsed.source_feature is None
+        assert parsed.named_captures == {}
+        assert parsed.positional_captures == ()
+
+    def test_pattern_match_without_source_feature_raises(self) -> None:
+        """A matched name with nothing before the separator still raises today's ValueError."""
+        with pytest.raises(ValueError, match="but has no source feature: orphan_pnb770_thing"):
+            FeatureChainParser.parse_name("orphan_pnb770_thing", [r"^orphan_pnb770_(\w+)$"])
+
+    def test_captureless_match_has_no_captures(self) -> None:
+        """A captureless pattern matches with zero captures of either kind."""
+        parsed = FeatureChainParser.parse_name("x__cleaned_text", [r".*__cleaned_text$"])
+
+        assert parsed.matched is True
+        assert parsed.source_feature == "x"
+        assert parsed.named_captures == {}
+        assert parsed.positional_captures == ()
+
+    def test_captureless_match_carries_the_raw_suffix_not_a_fabricated_token(self) -> None:
+        """operation_part is the raw text after the separator; the legacy 'cleaned' token is nowhere."""
+        parsed = FeatureChainParser.parse_name("x__cleaned_text", [r".*__cleaned_text$"])
+
+        assert parsed.operation_part == "cleaned_text"
+        assert "cleaned" not in dataclasses.asdict(parsed).values()
+
+
+class TestLegacyParseFeatureNameAdapter:
+    """parse_feature_name keeps returning exactly today's tuples: it is public API."""
+
+    def test_positional_capture_tuple_unchanged(self) -> None:
+        """Group 1 plus the source feature, as always."""
+        assert FeatureChainParser.parse_feature_name(
+            "f0__pca_legacy_pnb770", [LegacyPositionalGroup.PREFIX_PATTERN]
+        ) == (
+            "pca",
+            "f0",
+        )
+
+    def test_named_capture_tuple_uses_the_first_group(self) -> None:
+        """A named group is group 1 too, so the legacy tuple is unchanged."""
+        assert FeatureChainParser.parse_feature_name("f0__pca_2d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN]) == (
+            "pca",
+            "f0",
+        )
+
+    def test_captureless_no_longer_fabricates(self) -> None:
+        """#772: a captureless match no longer fabricates a token; operation_config is None, the source stays."""
+        assert FeatureChainParser.parse_feature_name("x__cleaned_text", [r".*__cleaned_text$"]) == (None, "x")
+
+    def test_miss_tuple_unchanged(self) -> None:
+        """No pattern match is still (None, None)."""
+        assert FeatureChainParser.parse_feature_name("unrelated_pnb770", [NamedCaptureGroup.PREFIX_PATTERN]) == (
+            None,
+            None,
+        )
+
+    def test_no_source_feature_valueerror_unchanged(self) -> None:
+        """match_parser_criteria depends on this raise, so the adapter must not swallow it."""
+        with pytest.raises(ValueError, match="but has no source feature: orphan_pnb770_thing"):
+            FeatureChainParser.parse_feature_name("orphan_pnb770_thing", [r"^orphan_pnb770_(\w+)$"])
+
+
+class TestBindNameCaptures:
+    """Binding is by name, deterministic, and documented: no first-matching-allowed_values search."""
+
+    def test_named_capture_binds_to_the_same_named_key(self) -> None:
+        """A named capture binds to the PROPERTY_MAPPING key of the same name."""
+        parsed = FeatureChainParser.parse_name("f0__pca_2d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, NamedCaptureGroup.PROPERTY_MAPPING)
+
+        assert bindings[ALGORITHM_KEY] == "pca"
+
+    def test_named_capture_binds_to_element_validator_only_spec(self) -> None:
+        """The core fix: a spec with NO allowed_values receives a name-derived value."""
+        parsed = FeatureChainParser.parse_name("f0__pca_2d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, NamedCaptureGroup.PROPERTY_MAPPING)
+
+        assert bindings[SIZE_KEY] == "2"
+
+    def test_multiple_named_captures_bind_to_separate_keys(self) -> None:
+        """Every capture reaches its own key, not just the first one."""
+        parsed = FeatureChainParser.parse_name("f0__tsne_7d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, NamedCaptureGroup.PROPERTY_MAPPING)
+
+        assert bindings == {ALGORITHM_KEY: "tsne", SIZE_KEY: "7"}
+
+    def test_named_capture_that_is_no_mapping_key_is_ignored(self) -> None:
+        """Patterns may use named groups for other purposes, so an unmapped name binds nothing."""
+        parsed = FeatureChainParser.parse_name("f0__pca_unmapped_pnb770", [UnmappedNamedCaptureGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, UnmappedNamedCaptureGroup.PROPERTY_MAPPING)
+
+        assert bindings == {}
+
+    def test_named_pattern_never_falls_back_to_the_reverse_lookup(self) -> None:
+        """'pca' is in algorithm's allowed_values, but a named pattern binds by name ONLY."""
+        parsed = FeatureChainParser.parse_name("f0__pca_unmapped_pnb770", [UnmappedNamedCaptureGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, UnmappedNamedCaptureGroup.PROPERTY_MAPPING)
+
+        assert ALGORITHM_KEY not in bindings
+
+    def test_non_participating_named_capture_binds_nothing(self) -> None:
+        """A None capture has no value to bind."""
+        parsed = FeatureChainParser.parse_name("f0__pca_optional_pnb770", [OptionalCaptureGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, OptionalCaptureGroup.PROPERTY_MAPPING)
+
+        assert bindings == {ALGORITHM_KEY: "pca"}
+
+    def test_legacy_positional_fallback_binds_group_one(self) -> None:
+        """With no named capture anywhere, group 1 still binds via allowed_values membership."""
+        parsed = FeatureChainParser.parse_name("f0__pca_legacy_pnb770", [LegacyPositionalGroup.PREFIX_PATTERN])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, LegacyPositionalGroup.PROPERTY_MAPPING)
+
+        assert bindings == {ALGORITHM_KEY: "pca"}
+
+    def test_legacy_fallback_binds_nothing_when_no_value_space_contains_the_value(self) -> None:
+        """The fallback only ever binds a value that is already a member of an allowed_values."""
+        parsed = FeatureChainParser.parse_name("f0__bogus_strict_pnb770", [r".*__(\w+)_strict_pnb770$"])
+
+        bindings = FeatureChainParser.bind_name_captures(parsed, LegacyPositionalGroup.PROPERTY_MAPPING)
+
+        assert bindings == {}
+
+    def test_miss_binds_nothing(self) -> None:
+        """An unmatched name has no captures to bind."""
+        parsed = FeatureChainParser.parse_name("unrelated_pnb770", [NamedCaptureGroup.PREFIX_PATTERN])
+
+        assert FeatureChainParser.bind_name_captures(parsed, NamedCaptureGroup.PROPERTY_MAPPING) == {}
+
+
+CAPTURELESS_PATTERN = r".*__cleaned_text$"
+
+
+def _resolve(name: str, group: type[FeatureChainParserMixin]) -> "parsed_feature_name.NameResolution":
+    return FeatureChainParser.resolve_name(name, group._get_prefix_patterns(), group._get_property_mapping())
+
+
+class TestNameResolution:
+    """resolve_name folds ownership, bindings and raw sources into one record."""
+
+    @pytest.mark.parametrize(
+        "name,group",
+        [
+            ("f0__pca_2d_pnb770", NamedCaptureGroup),
+            ("f0__pca_optional_pnb770", OptionalCaptureGroup),
+            ("f0__pca_legacy_pnb770", LegacyPositionalGroup),
+            ("f0__pca_unmapped_pnb770", UnmappedNamedCaptureGroup),
+            ("unrelated_pnb770", NamedCaptureGroup),
+        ],
+    )
+    def test_record_equals_the_separate_computations(self, name: str, group: type[FeatureChainParserMixin]) -> None:
+        parsed = FeatureChainParser.parse_name(name, group._get_prefix_patterns())
+
+        resolution = _resolve(name, group)
+
+        assert resolution.parsed == parsed
+        assert resolution.owned == FeatureChainParser._name_identifies_group(parsed, group._get_property_mapping())
+        assert dict(resolution.bindings) == FeatureChainParser.bind_name_captures(
+            parsed, group._get_property_mapping() or {}
+        )
+
+    def test_sources_are_the_raw_split_of_the_source_part(self) -> None:
+        assert _resolve("f1&f2&f3__pca_2d_pnb770", NamedCaptureGroup).sources == ("f1", "f2", "f3")
+
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("&f2__pca_2d_pnb770", ("", "f2")),
+            ("f1&__pca_2d_pnb770", ("f1", "")),
+            ("f1&&f2__pca_2d_pnb770", ("f1", "", "f2")),
+        ],
+    )
+    def test_sources_keep_empty_operands(self, name: str, expected: tuple[str, ...]) -> None:
+        assert _resolve(name, NamedCaptureGroup).sources == expected
+
+    def test_custom_in_feature_separator_splits_the_sources(self) -> None:
+        resolution = FeatureChainParser.resolve_name(
+            "f1,f2__pca_2d_pnb770",
+            [NamedCaptureGroup.PREFIX_PATTERN],
+            NamedCaptureGroup.PROPERTY_MAPPING,
+            in_feature_separator=",",
+        )
+
+        assert resolution.sources == ("f1", "f2")
+
+    def test_named_bindings_and_value_for(self) -> None:
+        resolution = _resolve("f0__tsne_7d_pnb770", NamedCaptureGroup)
+
+        assert resolution.owned is True
+        assert dict(resolution.bindings) == {ALGORITHM_KEY: "tsne", SIZE_KEY: "7"}
+        assert resolution.value_for(ALGORITHM_KEY) == "tsne"
+        assert resolution.value_for(SIZE_KEY) == "7"
+        assert resolution.value_for("no_such_key_pnb770") is None
+
+    def test_value_for_a_non_participating_named_capture_is_none(self) -> None:
+        resolution = _resolve("f0__pca_optional_pnb770", OptionalCaptureGroup)
+
+        assert resolution.value_for(ALGORITHM_KEY) == "pca"
+        assert resolution.value_for(SIZE_KEY) is None
+
+    def test_unmapped_named_capture_is_owned_binds_nothing_and_is_readable_by_name(self) -> None:
+        resolution = _resolve("f0__pca_unmapped_pnb770", UnmappedNamedCaptureGroup)
+
+        assert resolution.owned is True
+        assert dict(resolution.bindings) == {}
+        assert resolution.value_for("unmapped_pnb770") == "pca"
+
+    def test_positional_value_for_is_the_first_capture_for_any_key(self) -> None:
+        resolution = _resolve("f0__pca_legacy_pnb770", LegacyPositionalGroup)
+
+        assert resolution.owned is True
+        assert resolution.value_for(ALGORITHM_KEY) == "pca"
+        assert resolution.value_for(NOTES_KEY) == "pca"
+        assert resolution.value_for("anything_pnb770") == "pca"
+
+    def test_captureless_match_has_sources_and_no_value(self) -> None:
+        resolution = FeatureChainParser.resolve_name(
+            "x__cleaned_text", [CAPTURELESS_PATTERN], TextCleaningFeatureGroup.PROPERTY_MAPPING
+        )
+
+        assert resolution.parsed.matched is True
+        assert resolution.sources == ("x",)
+        assert dict(resolution.bindings) == {}
+        assert resolution.value_for(ALGORITHM_KEY) is None
+
+    def test_miss_is_not_owned_and_empty(self) -> None:
+        resolution = _resolve("unrelated_pnb770", NamedCaptureGroup)
+
+        assert resolution == parsed_feature_name.NameResolution.miss()
+        assert resolution.owned is False
+        assert resolution.parsed.matched is False
+        assert dict(resolution.bindings) == {}
+        assert resolution.sources == ()
+        assert resolution.value_for(ALGORITHM_KEY) is None
+
+    def test_matched_name_without_source_raises_like_parse_name(self) -> None:
+        with pytest.raises(ValueError, match="but has no source feature: orphan_pnb770_thing"):
+            FeatureChainParser.resolve_name("orphan_pnb770_thing", [r"^orphan_pnb770_(\w+)$"], {})
+
+    def test_record_is_frozen(self) -> None:
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(parsed_feature_name.NameResolution.miss(), "owned", True)
+
+    def test_mixin_facade_uses_the_class_patterns_mapping_and_separator(self) -> None:
+        resolution = NamedCaptureGroup.resolve_feature_name("f1&f2__tsne_7d_pnb770")
+
+        assert resolution == _resolve("f1&f2__tsne_7d_pnb770", NamedCaptureGroup)
+        assert resolution.sources == ("f1", "f2")
+        assert NamedCaptureGroup.resolve_feature_name(FeatureName("f1__pca_2d_pnb770")).sources == ("f1",)
+
+    def test_mixin_facade_miss(self) -> None:
+        assert NamedCaptureGroup.resolve_feature_name("unrelated_pnb770") == parsed_feature_name.NameResolution.miss()
+
+
+class TestDefinitionTimeAmbiguity:
+    """Legacy positional binding over intersecting value spaces is order-dependent: reject it at definition."""
+
+    def test_positional_capture_with_overlapping_value_spaces_raises(self) -> None:
+        """Two keys reachable by the same captured string make the binding a guess."""
+        with pytest.raises(ValueError) as exc_info:
+
+            class _OverlappingPositionalPnb770(FeatureChainParserMixin):
+                PREFIX_PATTERN = r".*__(\w+)_overlap_pnb770$"
+                PROPERTY_MAPPING = {
+                    ALGORITHM_KEY: PropertySpec("a", allowed_values=("pca", "shared_pnb770")),
+                    SOLVER_KEY: PropertySpec("b", allowed_values=("shared_pnb770", "auto")),
+                }
+
+        message = str(exc_info.value)
+        assert "_OverlappingPositionalPnb770" in message
+        assert ALGORITHM_KEY in message
+        assert SOLVER_KEY in message
+        assert "shared_pnb770" in message
+        assert "(?P<" in message
+
+    def test_feature_group_definition_is_validated_too(self) -> None:
+        """The check runs from FeatureGroup.__init_subclass__, not only from the mixin."""
+        with pytest.raises(ValueError) as exc_info:
+
+            class _OverlappingFeatureGroupPnb770(FeatureGroup):
+                PREFIX_PATTERN = r".*__(\w+)_overlapfg_pnb770$"
+                PROPERTY_MAPPING = {
+                    ALGORITHM_KEY: PropertySpec("a", allowed_values=("pca", "shared_pnb770")),
+                    SOLVER_KEY: PropertySpec("b", allowed_values=("shared_pnb770", "auto")),
+                }
+
+        assert "shared_pnb770" in str(exc_info.value)
+
+    def test_named_captures_make_the_same_overlap_unambiguous(self) -> None:
+        """Named binding is explicit, so intersecting value spaces are no problem at all."""
+
+        class _OverlappingNamedPnb770(FeatureChainParserMixin):
+            PREFIX_PATTERN = rf".*__(?P<{ALGORITHM_KEY}>\w+)_(?P<{SOLVER_KEY}>\w+)_named_pnb770$"
+            PROPERTY_MAPPING = {
+                ALGORITHM_KEY: PropertySpec("a", allowed_values=("pca", "shared_pnb770")),
+                SOLVER_KEY: PropertySpec("b", allowed_values=("shared_pnb770", "auto")),
+            }
+
+        parsed = FeatureChainParser.parse_name(
+            "f0__shared_pnb770_auto_named_pnb770", [_OverlappingNamedPnb770.PREFIX_PATTERN]
+        )
+        bindings = FeatureChainParser.bind_name_captures(parsed, _OverlappingNamedPnb770.PROPERTY_MAPPING)
+
+        assert bindings == {ALGORITHM_KEY: "shared_pnb770", SOLVER_KEY: "auto"}
+
+    def test_non_str_overlap_does_not_raise(self) -> None:
+        """A capture is always a str, so a non-str member is unreachable and cannot be ambiguous."""
+
+        class _NonStrOverlapPnb770(FeatureChainParserMixin):
+            PREFIX_PATTERN = r".*__(\w+)_nonstr_pnb770$"
+            PROPERTY_MAPPING = {
+                ALGORITHM_KEY: PropertySpec("a", allowed_values=(1, 2)),
+                SOLVER_KEY: PropertySpec("b", allowed_values=(2, 3)),
+            }
+
+        assert _NonStrOverlapPnb770.PREFIX_PATTERN.endswith("_nonstr_pnb770$")
+
+    def test_captureless_pattern_with_overlap_does_not_raise(self) -> None:
+        """With no capture group there is no value to misbind."""
+
+        class _CapturelessOverlapPnb770(FeatureChainParserMixin):
+            PREFIX_PATTERN = r".*__captureless_pnb770$"
+            PROPERTY_MAPPING = {
+                ALGORITHM_KEY: PropertySpec("a", allowed_values=("shared_pnb770",)),
+                SOLVER_KEY: PropertySpec("b", allowed_values=("shared_pnb770",)),
+            }
+
+        assert _CapturelessOverlapPnb770.PREFIX_PATTERN.endswith("__captureless_pnb770$")
+
+    def test_uncompilable_pattern_does_not_break_class_definition(self) -> None:
+        """A pattern this check cannot compile is treated as declaring no named group, never a definition crash."""
+
+        class _BrokenPatternPnb770(FeatureChainParserMixin):
+            PREFIX_PATTERN = r".*__([unclosed_pnb770$"
+            PROPERTY_MAPPING = {ALGORITHM_KEY: _algorithm_spec()}
+
+        assert _BrokenPatternPnb770.PROPERTY_MAPPING[ALGORITHM_KEY].strict_validation is True
+
+
+class TestBuildEffectiveOptions:
+    """Every binding is merged at once, and nothing to merge means the very same object back."""
+
+    def test_all_bindings_are_merged(self) -> None:
+        """Merging no longer stops after the first key."""
+        effective = FeatureChainParser.build_effective_options(
+            "f0__pca_2d_pnb770",
+            [NamedCaptureGroup.PREFIX_PATTERN],
+            NamedCaptureGroup.PROPERTY_MAPPING,
+            Options(),
+        )
+
+        assert effective.get(ALGORITHM_KEY) == "pca"
+        assert effective.get(SIZE_KEY) == "2"
+
+    def test_present_option_wins_over_a_binding(self) -> None:
+        """An explicit option is never overwritten by a name-derived value."""
+        options = Options(context={ALGORITHM_KEY: "tsne"})
+
+        effective = FeatureChainParser.build_effective_options(
+            "f0__pca_2d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN], NamedCaptureGroup.PROPERTY_MAPPING, options
+        )
+
+        assert effective.get(ALGORITHM_KEY) == "tsne"
+        assert effective.get(SIZE_KEY) == "2"
+
+    def test_nothing_to_merge_returns_the_same_object(self) -> None:
+        """Identity, not a copy: an unrelated name has nothing to contribute."""
+        options = Options(context={NOTES_KEY: "x"})
+
+        effective = FeatureChainParser.build_effective_options(
+            "unrelated_pnb770", [NamedCaptureGroup.PREFIX_PATTERN], NamedCaptureGroup.PROPERTY_MAPPING, options
+        )
+
+        assert effective is options
+
+    def test_unbindable_named_pattern_returns_the_same_object(self) -> None:
+        """A pattern whose named captures bind to nothing leaves the options untouched."""
+        options = Options()
+
+        effective = FeatureChainParser.build_effective_options(
+            "f0__pca_unmapped_pnb770",
+            [UnmappedNamedCaptureGroup.PREFIX_PATTERN],
+            UnmappedNamedCaptureGroup.PROPERTY_MAPPING,
+            options,
+        )
+
+        assert effective is options
+
+    def test_propagate_context_keys_survive_the_merge(self) -> None:
+        """Regression: the merged Options keeps the propagation contract of the original."""
+        options = Options(context={NOTES_KEY: "x"}, propagate_context_keys=frozenset({NOTES_KEY}))
+
+        effective = FeatureChainParser.build_effective_options(
+            "f0__pca_2d_pnb770", [NamedCaptureGroup.PREFIX_PATTERN], NamedCaptureGroup.PROPERTY_MAPPING, options
+        )
+
+        assert effective.propagate_context_keys == frozenset({NOTES_KEY})
+        assert effective.get(SIZE_KEY) == "2"
+
+
+class TestBoundValuesAreVisible:
+    """A name-bound value is a real value: required_when, match_guard and strict validation all see it."""
+
+    def test_required_when_sees_a_bound_secondary_capture(self) -> None:
+        """The predicate reads the size the name carries, so notes becomes required."""
+        result = RequiredWhenNamedGroup.match_feature_group_criteria("f0__pca_3d_reqwhen_pnb770", Options())
+
+        assert result is False
+
+    def test_required_when_satisfied_by_the_present_option(self) -> None:
+        """The same feature matches once the conditionally required option is there."""
+        result = RequiredWhenNamedGroup.match_feature_group_criteria(
+            "f0__pca_3d_reqwhen_pnb770", Options(context={NOTES_KEY: "n"})
+        )
+
+        assert result is True
+
+    def test_required_when_stays_off_when_the_bound_value_does_not_trigger_it(self) -> None:
+        """Guard against over-rejecting: a non-triggering bound value requires nothing."""
+        result = RequiredWhenNamedGroup.match_feature_group_criteria("f0__pca_2d_reqwhen_pnb770", Options())
+
+        assert result is True
+
+    def test_match_guard_sees_a_bound_value(self) -> None:
+        """A guard rejecting the name-carried value is a non-match."""
+        result = GuardedNamedGroup.match_feature_group_criteria("f0__tsne_guard_pnb770", Options())
+
+        assert result is False
+
+    def test_match_guard_accepts_a_bound_value_it_allows(self) -> None:
+        """The guard only rejects what it rejects."""
+        result = GuardedNamedGroup.match_feature_group_criteria("f0__pca_guard_pnb770", Options())
+
+        assert result is True
+
+    def test_strict_validation_sees_a_bound_value(self) -> None:
+        """A bound value outside the strict value space is a non-match."""
+        result = StrictNamedGroup.match_feature_group_criteria("f0__bogus_strict_pnb770", Options())
+
+        assert result is False
+
+    def test_strict_validation_accepts_a_bound_member(self) -> None:
+        """A bound member of the value space still matches."""
+        result = StrictNamedGroup.match_feature_group_criteria("f0__pca_strict_pnb770", Options())
+
+        assert result is True
+
+    def test_rejection_reason_reports_the_bound_value(self) -> None:
+        """The diagnostic replay must not disagree with the match decision."""
+        reason = StrictNamedGroup._strict_validation_rejection_reason("f0__bogus_strict_pnb770", Options())
+
+        assert reason is not None
+        assert ALGORITHM_KEY in reason
+        assert "bogus" in reason
+
+    def test_invalid_named_value_is_rejected_even_with_a_valid_option(
+        self, rejection_window: dict[str, MatchRejection]
+    ) -> None:
+        """The option no longer hides the name's own out-of-range value."""
+        options = Options(context={ALGORITHM_KEY: "pca"})
+        result = StrictNamedGroup.match_feature_group_criteria("f0__bogus_strict_pnb770", options)
+
+        assert result is False
+        recorded = [r.reason for r in rejection_window.values()]
+        assert len(recorded) == 1
+        assert "bogus" in recorded[0]
+        assert ALGORITHM_KEY in recorded[0]
+
+    def test_diagnostic_reports_the_invalid_named_value_despite_a_valid_option(self) -> None:
+        options = Options(context={ALGORITHM_KEY: "pca"})
+
+        reason = StrictNamedGroup._strict_validation_rejection_reason("f0__bogus_strict_pnb770", options)
+
+        assert reason is not None
+        assert "bogus" in reason
+        assert ALGORITHM_KEY in reason
+
+    def test_valid_named_value_with_the_same_valid_option_still_matches(self) -> None:
+        options = Options(context={ALGORITHM_KEY: "pca"})
+
+        assert StrictNamedGroup.match_feature_group_criteria("f0__pca_strict_pnb770", options) is True
+        assert StrictNamedGroup._strict_validation_rejection_reason("f0__pca_strict_pnb770", options) is None
+
+
+class TestValidateNameBindings:
+    """FeatureChainParser.validate_name_bindings raises on the first invalid binding."""
+
+    def test_valid_bindings_return_none(self) -> None:
+        bindings = {ALGORITHM_KEY: "pca", SIZE_KEY: "3"}
+
+        result = FeatureChainParser.validate_name_bindings(bindings, NamedCaptureGroup.PROPERTY_MAPPING)
+
+        assert result is None
+
+    def test_empty_bindings_return_none(self) -> None:
+        assert FeatureChainParser.validate_name_bindings({}, NamedCaptureGroup.PROPERTY_MAPPING) is None
+
+    def test_out_of_range_binding_raises_value_rejection(self) -> None:
+        with pytest.raises(PropertyValueRejection, match="bogus"):
+            FeatureChainParser.validate_name_bindings({ALGORITHM_KEY: "bogus"}, NamedCaptureGroup.PROPERTY_MAPPING)
+
+    def test_element_validator_rejection_raises_value_rejection(self) -> None:
+        with pytest.raises(PropertyValueRejection, match="abc"):
+            FeatureChainParser.validate_name_bindings(
+                {ALGORITHM_KEY: "pca", SIZE_KEY: "abc"}, NamedCaptureGroup.PROPERTY_MAPPING
+            )
+
+
+class TestForwardedMismatchOverBindings:
+    """Forwarded-mismatch protection covers every bound capture, not only group 1."""
+
+    def test_fixture_matches_without_options(self) -> None:
+        """Precondition: the fixture claims the chained name via string parsing."""
+        assert ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, Options()) is True
+
+    def test_forwarded_secondary_capture_mismatch_raises(self) -> None:
+        """The solver key is bound by a SECONDARY capture, which today's single reverse lookup misses."""
+        child_options = _inherited_child_options({SOLVER_KEY: "arpack"})
+        assert child_options.inherited_group_keys == frozenset({SOLVER_KEY})  # precondition
+
+        with pytest.raises(ValueError) as exc_info:
+            ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options)
+
+        message = str(exc_info.value)
+        assert FORWARDED_FEATURE_NAME in message
+        assert SOLVER_KEY in message
+        assert "arpack" in message
+        assert "auto" in message
+        assert "forward_group_exclude" in message
+        assert "MLODA_ALLOW_FORWARDED_NAME_MISMATCH" in message
+
+    def test_forwarded_secondary_capture_equal_value_matches(self) -> None:
+        """An agreeing forwarded value is no mismatch."""
+        child_options = _inherited_child_options({SOLVER_KEY: "auto"})
+
+        assert ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options) is True
+
+    def test_forwarded_primary_capture_mismatch_still_raises(self) -> None:
+        """Group 1 keeps the protection it has today."""
+        child_options = _inherited_child_options({ALGORITHM_KEY: "tsne"})
+
+        with pytest.raises(ValueError, match="forward_group_exclude"):
+            ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options)
+
+    def test_forwarded_singleton_unwrap_still_applies_to_a_secondary_capture(self) -> None:
+        """#764 semantics: a forwarded singleton equals its sole element."""
+        child_options = _inherited_child_options({SOLVER_KEY: ["auto"]})
+
+        assert ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options) is True
+
+    def test_author_set_secondary_value_contradicting_the_name_raises(self) -> None:
+        """A declared secondary value contradicting the name's capture aborts the match."""
+        child_options = Options(group={SOLVER_KEY: "arpack"})
+        assert child_options.inherited_group_keys == frozenset()  # precondition
+
+        with pytest.raises(ValueError) as exc_info:
+            ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options)
+
+        message = str(exc_info.value)
+        assert SOLVER_KEY in message
+        assert "arpack" in message
+        assert "auto" in message
+
+    def test_author_set_secondary_value_agreeing_with_the_name_matches(self) -> None:
+        child_options = Options(group={SOLVER_KEY: "auto"})
+
+        assert ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options) is True
+
+    def test_env_var_downgrades_the_secondary_mismatch_to_a_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The escape hatch covers the secondary capture too."""
+        monkeypatch.setenv("MLODA_ALLOW_FORWARDED_NAME_MISMATCH", "1")
+        child_options = _inherited_child_options({SOLVER_KEY: "arpack"})
+
+        with caplog.at_level(logging.WARNING):
+            result = ForwardedSecondaryGroup.match_feature_group_criteria(FORWARDED_FEATURE_NAME, child_options)
+
+        assert result is True
+        records = [record for record in caplog.records if SOLVER_KEY in record.getMessage()]
+        assert len(records) == 1
+
+
+class TestShippedPluginsUnchanged:
+    """Shipped PREFIX_PATTERNs stay positional and must parse byte-for-byte as before."""
+
+    def test_aggregated_feature_group_parses_unchanged(self) -> None:
+        """Group 1 is the aggregation type, everything before the separator is the source."""
+        parsed = FeatureChainParser.parse_feature_name("sales__sum_aggr", [AggregatedFeatureGroup.PREFIX_PATTERN])
+
+        assert parsed == ("sum", "sales")
+
+    def test_aggregated_feature_group_rejects_a_trailing_newline(self) -> None:
+        """A name with a trailing newline is not a match, even though regex `$` would allow it."""
+        name = "sales__sum_aggr\n"
+
+        assert FeatureChainParser.parse_feature_name(name, [AggregatedFeatureGroup.PREFIX_PATTERN]) == (None, None)
+        assert AggregatedFeatureGroup.match_feature_group_criteria(name, Options()) is False
+
+    def test_aggregated_feature_group_still_matches(self) -> None:
+        """The shipped matcher keeps claiming its chained name with no options at all."""
+        assert AggregatedFeatureGroup.match_feature_group_criteria("sales__sum_aggr", Options()) is True
+
+    def test_scaling_feature_group_parses_unchanged(self) -> None:
+        """The alternation capture is group 1, as before."""
+        parsed = FeatureChainParser.parse_feature_name("income__standard_scaled", [ScalingFeatureGroup.PREFIX_PATTERN])
+
+        assert parsed == ("standard", "income")
+
+    def test_scaling_feature_group_rejects_an_unknown_scaler(self) -> None:
+        """A value outside the alternation is still no match for the pattern."""
+        parsed = FeatureChainParser.parse_feature_name("income__bogus_scaled", [ScalingFeatureGroup.PREFIX_PATTERN])
+
+        assert parsed == (None, None)
+
+    def test_text_cleaning_captureless_no_longer_fabricates(self) -> None:
+        """The only captureless shipped pattern: #772 retires the fabrication, so operation_config is None."""
+        parsed = FeatureChainParser.parse_feature_name("text__cleaned_text", [TextCleaningFeatureGroup.PREFIX_PATTERN])
+
+        assert parsed == (None, "text")

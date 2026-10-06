@@ -1,0 +1,427 @@
+## Join datasets
+
+Combining datasets from various feature groups is crucial for building comprehensive and scalable data processing pipelines. The framework automatically handles data merging in the background to accommodate the following scenarios:
+
+-   **Different Compute Frameworks**: Merging data from feature groups that utilize different underlying compute technologies.
+-   **Same Compute Framework, Different Sources**: Combining datasets that use the same compute framework but originate from different data sources.
+-   **Same Feature Group, Different Feature Options**: Integrating data from the same feature group configured with different feature options.
+-   **Multiple Links on the Same Compute Framework**: Joining a single base FG to multiple right-side FGs (same class, subclasses, or distinct) all within the same compute framework.
+
+
+_**If we have a feature, which is dependent on an aforementioned setup,**_
+
+-   we need to define a Link,
+-   and the ComputeFramework must support the according merge!
+
+
+We will first discuss the basic building blocks of the **Links** (**Index**, **Join Types**) and then the **merge** in the ComputeFramework.
+
+#### Index
+
+The Index class defines the keys (columns) used to merge datasets. An index is a tuple of strings.
+
+Properties:
+    
+-   Multi-Index Support: Supports multi-column keys for complex merges.
+-   Comparison Operations: Methods to compare indexes and determine subset relationships.
+-   Utility Methods: Provides methods to check if the index is a multi-index.
+
+Example:
+
+```python
+from mloda.user import Index
+
+# Create an Index with a single column
+single_column_index = Index(('user_id',))
+
+# Create an Index with multiple columns (multi-index)
+multi_column_index = Index(('user_id', 'timestamp'))
+
+# Check if an index is a multi-index
+is_multi = multi_column_index.is_multi_index()  # Returns True
+
+# Check if single column is a part of a composite index
+is_a_part_of = single_column_index.is_a_part_of(multi_column_index) # Returns True
+```
+
+#### JoinType
+
+Join Types specify how two datasets are merged based on their keys. The framework supports the following join types:
+
+-   Inner Join,
+-   Left Join,
+-   Outer Join,
+-   Right Join (use sparingly; prefer left joins when possible). The declared left feature group's data is the merge engine's left argument, whichever compute framework the join executes in.
+-   ASOF Join (point-in-time / as-of: equi match on the by-keys, nearest time match on the time columns).
+
+```python
+from enum import Enum
+
+class JoinType(Enum):
+    INNER = "inner"
+    LEFT = "left"
+    RIGHT = "right"
+    OUTER = "outer"
+    APPEND = "append"
+    UNION = "union"
+    ASOF = "asof"
+
+join_type = JoinType.INNER
+```
+
+ASOF joins are created via `Link.asof(...)` / `Link.asof_on(...)`, carrying time columns plus
+`direction`/`tolerance`/`allow_exact_matches` (pandas `merge_asof` semantics). The by-keys (the
+join `Index`) drive the equi match; the time columns drive the inequality match. ASOF is a LEFT
+join: every left row survives, with null right columns when no match is found.
+
+**Backend support.** Implemented for `pandas`, `polars` (eager and lazy), `duckdb`, `python_dict`,
+`pyarrow`, `sqlite`, and `spark` (requires Java 17+ on `JAVA_HOME`). `iceberg` has no merge
+engine and does not support joins.
+
+Cross-backend caveats to be aware of:
+
+-   **`direction='nearest'`** is supported on `pandas`, `polars`, and `python_dict`. `pyarrow` and the
+    SQL/Spark backends (`duckdb`, `sqlite`, `spark`) raise `ValueError` for `nearest`: Acero's
+    `join_asof` and the SQL forms express only a directional (forward/backward) match.
+-   **`tolerance`** accepts `float | int | timedelta`. A `timedelta` tolerance is forwarded natively
+    only by `pandas`/`polars`/`python_dict`. `pyarrow` and the SQL/Spark backends (`duckdb`, `sqlite`,
+    `spark`) cannot derive a numeric tolerance from a `timedelta` and raise `ValueError`; provide a
+    numeric tolerance (e.g. epoch seconds matching the time column). This is enforced inside the merge
+    engine at run time, not at `Link.asof(...)` construction.
+-   **`pyarrow` is the most restrictive as-of backend.** Backed by Acero's `Table.join_asof`, it
+    rejects `direction='nearest'`, requires an *integer* `tolerance` (an integer-valued float such as
+    `5.0` is accepted, `5.5` is not; `timedelta` is rejected), and rejects `allow_exact_matches=False`
+    (Acero's match range always includes the exact-time row). Treat it like the SQL backends
+    (directional match, numeric tolerance), not like `pandas`/`polars`.
+-   **Overlapping non-key columns.** If the left and right frames share a column name other than the
+    by-keys/time columns, `pandas` keeps both with `_x`/`_y` suffixes, whereas `pyarrow` and the
+    SQL/`polars`/`python_dict` backends keep the left column and drop the right one. Rename
+    conflicting columns upstream if you need both.
+-   **Time-column dtype.** As-of time columns must be ordered (datetime, numeric, or timedelta). A
+    non-ordered column (e.g. ISO-date strings / object dtype) raises a clear `ValueError` naming the
+    column; cast it to a real datetime or numeric before joining. This is enforced uniformly across
+    all backends inside the merge engine at run time.
+-   **`coerce_time_columns`** (opt-in flag on `Link.asof(...)` / `Link.asof_on(...)` /
+    `AsOfJoinConfig`, default `False`). With the default, the strict `ValueError` above applies.
+    When `True`, ISO-8601 string time columns are coerced per backend: `pandas`, `polars`,
+    `pyarrow`, and `spark` cast to native timestamps, `python_dict` to `datetime` (a trailing `Z`
+    is accepted as `+00:00`), and `sqlite` to `julianday` NUMERIC (so a numeric `tolerance` is in
+    days). `duckdb` rejects strings carrying a UTC offset or trailing `Z` (cast manually), and
+    `sqlite` additionally rejects one-sided string-vs-numeric coercion (cast manually). Coercion
+    fails hard on unparseable or non-ISO values and never produces silent null matches; mixed
+    tz-naive/tz-aware values are rejected where the backend can detect them (via the
+    [comparison contract](comparison-contract.md)).
+-   **Ties.** When two right rows share the identical boundary timestamp within a by-key, the chosen
+    row is backend-defined (each engine applies its own internal tie rule). `python_dict`,
+    `duckdb`, `sqlite`, and `spark` resolve ties deterministically (smallest surviving right column
+    values win); the other backends follow their native `merge_asof` behavior. Do not rely on
+    a specific tied row being selected across backends.
+
+#### Link
+
+A Link specifies the relationship of:
+
+-   join type,
+-   the feature groups involved,
+-   and the indexes to use for the join.
+
+```python
+from mloda.user import Link, JoinSpec
+from mloda.provider import FeatureGroup
+
+# Assume FeatureGroupA and FeatureGroupB are defined feature groups
+feature_group_a = FeatureGroup()
+feature_group_b = FeatureGroup()
+
+# JoinSpec accepts multiple index formats:
+# - String for single column: "id"
+# - Tuple for single/multiple columns: ("id",) or ("col1", "col2")
+# - Explicit Index: Index(("id",))
+
+# Simple single-column join using string
+link = Link.inner(
+    left=JoinSpec(feature_group_a, "id"),
+    right=JoinSpec(feature_group_b, "feature_a_id")
+)
+
+# Multi-column join using tuple
+link = Link.inner(
+    left=JoinSpec(feature_group_a, ("id", "timestamp")),
+    right=JoinSpec(feature_group_b, ("ref_id", "ref_time"))
+)
+
+# Explicit Index syntax (equivalent to string/tuple above)
+link = Link.inner(
+    left=JoinSpec(feature_group_a, Index(("id",))),
+    right=JoinSpec(feature_group_b, Index(("feature_a_id",)))
+)
+```
+
+#### Convenience _on Methods
+
+For feature groups that define `index_columns()`, you can use the convenience `_on` methods to automatically derive the join index:
+
+```python
+from mloda.user import Link, Index
+
+# Define feature groups with index_columns
+class UserFeatureGroup(FeatureGroup):
+    @classmethod
+    def index_columns(cls):
+        return [Index(("user_id",))]
+
+class OrderFeatureGroup(FeatureGroup):
+    @classmethod
+    def index_columns(cls):
+        return [Index(("user_id",)), Index(("order_id",))]
+
+# Instead of verbose JoinSpec construction:
+link = Link.inner(
+    JoinSpec(UserFeatureGroup, UserFeatureGroup.index_columns()[0]),
+    JoinSpec(OrderFeatureGroup, OrderFeatureGroup.index_columns()[0])
+)
+
+# Use the convenient _on method:
+link = Link.inner_on(UserFeatureGroup, OrderFeatureGroup)
+
+# Select specific index when feature group has multiple (0-based position):
+link = Link.inner_on(UserFeatureGroup, OrderFeatureGroup, left_index=0, right_index=1)
+```
+
+Available `_on` methods: `inner_on`, `left_on`, `right_on`, `outer_on`, `append_on`, `union_on`, `asof_on`
+
+**Note:** The `_on` methods raise `ValueError` if the feature group doesn't define `index_columns()` or returns an empty list, and `IndexError` if the specified index position is out of range.
+
+**Note:** Explicit `JoinSpec` (Option 1 above) works regardless of whether the feature group defines `index_columns()`. The engine automatically injects the join columns specified in the `JoinSpec` into that feature group's feature set. The `_on` shorthand requires `index_columns()`.
+
+#### Star Joins (Link.star)
+
+When several feature groups share one row-index column and all join back to a single hub, `Link.star` builds the whole set of links in one call instead of a hand-rolled loop of `Link.inner(...)`:
+
+```python
+from mloda.user import Link, JoinType
+from mloda.provider import FeatureGroup
+
+# A hub feature group and two spokes that share the "row_id" column:
+class HubFG(FeatureGroup):
+    pass
+
+class SpokeAFG(FeatureGroup):
+    pass
+
+class SpokeBFG(FeatureGroup):
+    pass
+
+# First feature group is the hub; every remaining group is a spoke joined to it
+# on the shared index column. Returns a set of Links.
+links = Link.star(HubFG, SpokeAFG, SpokeBFG, index_column="row_id")
+
+# Equivalent to building, by hand:
+#   Link.inner(JoinSpec(HubFG, Index(("row_id",))), JoinSpec(SpokeAFG, Index(("row_id",))))
+#   Link.inner(JoinSpec(HubFG, Index(("row_id",))), JoinSpec(SpokeBFG, Index(("row_id",))))
+```
+
+- **`index_column`** is keyword-only and accepts a `str`, a `tuple[str, ...]` (multi-column), or an explicit `Index`. It is normalized once and reused on both sides of every link, so all three forms are equivalent.
+- **`jointype`** is keyword-only and defaults to `JoinType.INNER`. It accepts a `JoinType` or its string form and must be one of `inner`, `left`, or `outer`; the same type is applied to every spoke:
+
+```python
+links = Link.star(HubFG, SpokeAFG, SpokeBFG, index_column="row_id", jointype=JoinType.LEFT)
+```
+
+- `right`, `append`, and `union` are rejected with a `ValueError` (a star anchors on the hub, so they do not fit); `asof` joins need `Link.asof(...)`.
+- At least two feature groups are required (a hub plus one spoke), and the hub class cannot also appear as a spoke. Duplicate spokes collapse in the returned set.
+- **Scope:** `Link.star` targets joins between distinct feature-group classes and does not carry discriminators, so it cannot disambiguate multiple same-class nodes. For same-class self-joins, use `Link.inner` with discriminators (see below).
+
+The returned set is passed straight to `mlodaAPI` like any other link set.
+
+#### Same-Class Joins with Discriminators
+
+When joining a feature group with itself (or two nodes of the same class loading different data sources), you need to distinguish between the left and right instances using **discriminators**.
+
+**Discriminators** are optional dictionary parameters (`left_discriminator` and `right_discriminator`) that match against feature options:
+
+```python
+from mloda.user import Feature, Index, Link
+
+# Define an example feature group for demonstration
+class UserFeatureGroup(FeatureGroup):
+    @classmethod
+    def index_columns(cls):
+        return [Index(("user_id",))]
+
+# Option 1: Using _on method (recommended when index_columns is defined)
+link = Link.inner_on(UserFeatureGroup, UserFeatureGroup,
+                     left_discriminator={"side": "left"},
+                     right_discriminator={"side": "right"})
+
+# Option 2: Using explicit JoinSpec
+left = JoinSpec(UserFeatureGroup, "user_id")
+right = JoinSpec(UserFeatureGroup, "user_id")
+
+link = Link("inner", left, right,
+            left_discriminator={"side": "left"},
+            right_discriminator={"side": "right"})
+
+# 2. Tag features with matching options
+# Feature names reference the feature from the feature group
+features = {
+    Feature("age", options={"side": "left"}),
+    Feature("age", options={"side": "right"}),
+}
+```
+
+The execution planner validates that the discriminator key-value pairs exist in the corresponding feature's options to correctly identify which instance belongs to which side of the join.
+
+The two sides may use different key column names: each side's key column is injected only into the nodes matching that side's discriminator.
+
+Discriminators are part of a link's identity, so two links that differ only by their discriminators are distinct in `links=`, letting one node join to several same-class nodes.
+
+#### Polymorphic Link Matching
+
+Links support inheritance-based matching, allowing a link defined with base classes to automatically apply to subclasses. This enables defining generic join relationships that work across feature group hierarchies.
+
+**Matching Rules:**
+
+1. **Exact match first**: If a link's feature groups exactly match the classes being joined, it takes priority over any polymorphic matches.
+
+2. **Balanced inheritance**: For polymorphic matches, both sides must have the same inheritance distance from the link's defined classes. This prevents sibling class mismatches.
+
+3. **Most specific wins**: Among valid balanced matches, the link closest in the inheritance hierarchy is selected.
+
+**Example:**
+
+```python
+# Define a base feature group hierarchy
+class BaseUserFeatureGroup(FeatureGroup):
+    pass
+
+class PremiumUserFeatureGroup(BaseUserFeatureGroup):
+    pass
+
+class StandardUserFeatureGroup(BaseUserFeatureGroup):
+    pass
+
+# Define a link using base classes
+link = Link.inner(
+    left=JoinSpec(BaseUserFeatureGroup, "user_id"),
+    right=JoinSpec(BaseUserFeatureGroup, "user_id")
+)
+
+# This link will match:
+# - (PremiumUserFeatureGroup, PremiumUserFeatureGroup) ✓
+# - (StandardUserFeatureGroup, StandardUserFeatureGroup) ✓
+# - (BaseUserFeatureGroup, BaseUserFeatureGroup) ✓
+
+# This link will NOT match (sibling mismatch):
+# - (PremiumUserFeatureGroup, StandardUserFeatureGroup) ✗
+```
+
+The balanced inheritance rule ensures that joins only occur between "parallel" subclasses - both sides must be at the same level in the inheritance hierarchy relative to the link definition.
+
+Key injection follows the same subclass rule: a link declared on a base class injects its key column into subclass nodes on that side just as it would the declared class, so a subclass must provide that column even when a more specific link also applies. Discriminators narrow the side only when a class matches both sides. A node whose requested feature is itself one of its links' key columns receives no other key, which keeps batches named after their key column distinguishable.
+
+When multiple batches match (e.g. three subclasses all matching a base-class link), the engine disambiguates using `right_index`: first by exact `feature.index` match, then by checking whether the feature name appears in the join key columns of `right_index`. Ensure each link's `right_index` contains the column name that uniquely identifies its right-side batch.
+
+#### mlodaAPI
+
+```py
+from mloda.user import mloda
+
+set_of_links = {link}
+
+mloda.run_all(
+    features=["Feature_of_FeatureGroupA", "Feature_of_FeatureGroupB"],
+    links=set_of_links
+    )
+```
+
+mloda will then use the merge implementation in the compute framework and use the given links to join datasets, if needed.
+
+A feature between a join side and the feature consuming the join runs on that side's compute framework. The one exception is a direct input of the consumer that is pinned to another framework: the join then reads that side through the input's hop. Still rejected at plan time are an off-framework feature below another input of the consumer, one side reaching the consumer through two different frameworks, inputs off the sides' framework when the two sides differ in framework, and any such input for APPEND or UNION links. If one consumer is requested with options that reach different variants of the join sides, each variant gets its own join, also when the variants differ on one side only, and each consumer waits only on its own join.
+
+In the following section, we will see how this can look like.
+
+#### Merging Data in the Compute Framework
+
+The compute framework uses the base class BaseMergeEngine as configuration.
+In this example, we show the PandasMergeEngine.
+
+On DuckDB and SQLite (and the Spark as-of merge under the default `spark.sql.caseSensitive=false`), a merge whose output column names differ only in case raises `ValueError`; see [Column name case sensitivity](compute-framework-integration.md#column-name-case-sensitivity).
+
+```py
+class PandasDataFrame(ComputeFramework):
+    @classmethod
+    def merge_engine(cls) -> type[BaseMergeEngine]:
+        return PandasMergeEngine
+```
+
+The merge can implement:
+
+-   **merge_inner**
+-   **merge_left**
+-   **merge_right**
+-   **merge_full_outer**
+-   **merge_append**
+-   **merge_union**
+-   **merge_asof**
+
+These methods are invoked via the final implementation in the abstract class **BaseMergeEngine**, which receives the `Link` and reads the join type and indexes from it:
+
+```py
+@final
+def merge(self, left_data: Any, right_data: Any, link: Link) -> Any:
+    self.check_import()
+
+    jointype = link.jointype
+    left_index = link.left_index
+    right_index = link.right_index
+    ...
+    if jointype == JoinType.INNER:
+        return self.merge_inner(left_data, right_data, left_index, right_index)
+    elif jointype == JoinType.LEFT:
+        return self.merge_left(left_data, right_data, left_index, right_index)
+    ...
+    elif jointype == JoinType.ASOF:
+        return self.merge_asof(left_data, right_data, left_index, right_index, link.asof_config)
+```
+
+A simplified MergeEngine implementation looks like this:
+```py
+class PandasMergeEngine(BaseMergeEngine):
+    def merge_inner(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
+        return self.join_logic("inner", left_data, right_data, left_index, right_index, JoinType.INNER)
+
+    def merge_left(...)
+        ...
+
+    def merge_right(...)
+        ...
+
+    def merge_outer(...)
+        ...
+
+    def join_logic(
+        self, join_type: str, left_data: Any, right_data: Any, left_index: Index, right_index: Index, jointype: JoinType
+    ) -> Any:
+        left_idx: str | list[str]
+        right_idx: str | list[str]
+        if left_index.is_multi_index() or right_index.is_multi_index():
+            left_idx = list(left_index.index)
+            right_idx = list(right_index.index)
+        else:
+            left_idx = left_index.index[0]
+            right_idx = right_index.index[0]
+
+        left_data = self.pd_merge()(left_data, right_data, left_on=left_idx, right_on=right_idx, how=join_type)
+        return left_data
+```
+
+
+
+Key Components:
+
+-   **left_data**: Left dataset for the join.
+-   **right_data**: Right dataset for the join.
+-   **link**: The Link carrying the join type (`link.jointype`), the join keys (`link.left_index`, `link.right_index`), and for as-of joins the `link.asof_config`.
+
+By implementing these merge functionality, the compute framework automatically handles data merging operations in the background, aligning with the relationships defined by **Index**, **JoinType**, and **Link**.

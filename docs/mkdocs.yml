@@ -1,0 +1,70 @@
+site_name: mloda docs
+nav:
+  - Home: 
+    - index.md
+  - mloda Concepts:
+    - Table of Content: examples/mloda_basics/0_table_of_content.ipynb
+    - Intro to the core interfaces of mloda: examples/mloda_basics/1_ml_mloda_intro.ipynb
+    - What makes mloda unique: examples/mloda_basics/2_ml_advantage_process_focus.ipynb
+    - Data, Feature, FeatureSets and FeatureGroups in mloda: examples/mloda_basics/3_ml_data_feature_feature_groups.ipynb
+    - Provider, User, Steward in mloda: examples/mloda_basics/4_ml_data_providers_user_steward.ipynb
+  - Getting Started:
+    - Installation: chapter1/installation.md
+    - API Request: chapter1/api-request.md
+    - Feature Groups: chapter1/feature-groups.md
+    - Compute Frameworks: chapter1/compute-frameworks.md
+    - Extender: chapter1/extender.md
+    - Base Usage: examples/base_usage.ipynb
+    - sklearn Integration Tutorial: examples/sklearn_integration_basic.ipynb
+  - In Depth - Basics:
+    - mloda API: in_depth/mloda-api.md
+    - Streaming: in_depth/streaming.md
+    - (Feature) data: in_depth/access-feature-data.md
+    - Join data: in_depth/join_data.md
+    - Filter data: in_depth/filter_data.md
+    - Mask Engine: in_depth/mask_engine.md
+    - Artifacts: in_depth/artifacts.md
+  - In Depth - Advanced:
+    - Data quality: in_depth/data-quality.md
+    - Domain concept: in_depth/domain.md
+    - Data Access Patterns: in_depth/data-access-patterns.md
+    - Named Data Access Handles: in_depth/named-data-access-handles.md
+    - Compute Frameworks:
+      - Framework Transformers: in_depth/framework-transformers.md
+      - Compute Framework Integration: in_depth/compute-framework-integration.md
+      - Framework Connection Object: in_depth/framework-connection-object.md
+    - Feature Groups:
+      - Feature Configuration: in_depth/feature-config.md
+      - Feature Chain Parser: in_depth/feature-chain-parser.md
+      - Feature Group Matching: in_depth/feature-group-matching.md
+      - PROPERTY_MAPPING: in_depth/property-mapping.md
+      - Feature Group Testing: in_depth/feature-group-testing.md
+      - Feature Group Versioning: in_depth/feature-group-version.md
+      - Multiple Result Columns: in_depth/multiple_result_columns.md
+    - Plugin System:
+      - Discover Plugins: in_depth/discover-plugins.md
+      - Plugin Loader: in_depth/plugin-loader.md
+      - Plugin Registry: in_depth/plugin_registry.md
+      - Plan Lock: in_depth/plan-lock.md
+    - Data Type Enforcement: in_depth/data-type-enforcement.md
+    - Comparison Contract: in_depth/comparison-contract.md
+    - Troubleshooting:
+      - Feature Group Resolution Errors: in_depth/troubleshooting/feature-group-resolution-errors.md
+    
+  - Development:
+    - Contributors: development.md
+    - License - Apache 2.0: license.md
+  - Need Help?:
+    - FAQ: faq.md
+
+theme:
+  name: readthedocs
+
+hooks:
+  - marimo_export_hook.py
+
+plugins:
+  - search
+  - mkdocs-jupyter:
+      include: ["*.ipynb"]
+      execute: false

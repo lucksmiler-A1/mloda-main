@@ -1,0 +1,68 @@
+branches:
+  - main
+tagFormat: ${version}
+plugins:
+  - [
+      "@semantic-release/commit-analyzer",
+      {
+        preset: "conventionalcommits",
+        releaseRules:
+          [
+            { type: "minor", release: "minor" },
+            { type: "feat", release: "patch" },
+            { type: "impr", release: "patch" },
+            { type: "refactor", release: "patch" },
+            { type: "perf", release: "patch" },
+            { type: "fix", release: "patch" },
+            { type: "ci", release: "patch" },
+            { type: "docs", release: "patch" },
+            { type: "chore", release: "patch" },
+            { type: "style", release: "patch" },
+            { type: "test", release: "patch" },
+            { type: "build", release: "patch" },
+          ],
+      },
+    ]
+  - [
+      "@semantic-release/release-notes-generator",
+      {
+        preset: "conventionalcommits",
+        presetConfig:
+          {
+            types:
+              [
+                { type: "minor", section: "🎯 Minor Release" },
+                { type: "feat", section: "✨ Features" },
+                { type: "impr", section: "🚀 Improvements" },
+                { type: "refactor", section: "♻️ Improvements" },
+                { type: "perf", section: "⚡️ Improvements" },
+                { type: "build", section: "📦 Improvements" },
+                { type: "fix", section: "🐛 Bug Fixes" },
+                { type: "ci", section: "👷 CI" },
+                { type: "docs", section: "📚 Documentation" },
+                { type: "chore", section: "🔧 Miscellaneous" },
+                { type: "style", section: "🎨 Miscellaneous" },
+                { type: "test", section: "✅ Miscellaneous" },
+              ],
+          },
+      },
+    ]
+  - [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": 'sed -i ''s/^version = .*$/version = "${nextRelease.version}"/'' pyproject.toml && uv lock && python -m attribution.attributions sync-version "${nextRelease.version}"',
+      },
+    ]
+  - [
+      "@semantic-release/github",
+      {
+        "assets": ["attribution/*.md"],
+        "releasedLabels": ["released"],
+        "releaseNameTemplate": "🚀 Version ${nextRelease.version}",
+      },
+    ]
+  - [
+      "@semantic-release/git",
+      { "assets": ["pyproject.toml", "uv.lock", "attribution/ATTRIBUTION.md"] },
+    ]
+repositoryUrl: "https://github.com/mloda-ai/mloda"

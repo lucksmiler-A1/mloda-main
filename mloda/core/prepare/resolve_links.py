@@ -1,0 +1,417 @@
+from collections import OrderedDict, defaultdict
+from typing import Any
+from uuid import UUID
+
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.prepare.graph.graph import Graph
+from mloda.core.abstract_plugins.components.link import JoinType, Link
+from mloda.core.prepare.validators.resolve_link_validator import ResolveLinkValidator
+
+
+LinkFrameworkTrekker = tuple[Link, type[ComputeFramework], type[ComputeFramework]]
+
+
+def inheritance_distance(child: type, parent: type) -> int:
+    """Steps from child to parent in the MRO, or 9999 if parent is not in child's hierarchy."""
+    mro: tuple[type, ...] = getattr(child, "__mro__", ())
+    return mro.index(parent) if parent in mro else 9999
+
+
+class LinkTrekker:
+    """This class is used to keep track of Links and which children depend on this link."""
+
+    def __init__(self) -> None:
+        self.data: dict[LinkFrameworkTrekker, set[UUID]] = defaultdict(set)
+        self.data_ordered: OrderedDict[LinkFrameworkTrekker, set[UUID]] = OrderedDict()
+
+        self.order: OrderedDict[UUID, set[UUID]] = OrderedDict()
+
+    def update(self, key: LinkFrameworkTrekker, value: UUID) -> None:
+        self.data[key].add(value)
+
+    def invert_link(
+        self, link: Link, left_cfw: type[ComputeFramework], right_cfw: type[ComputeFramework], uuid: UUID
+    ) -> None:
+        """
+        The purpose of this function is to invert left and right of an index during a run.
+        """
+
+        # if data is not there, we plug it behind the existing link
+        if (link, right_cfw, left_cfw) not in self.data_ordered:
+            position = self.get_position(link, left_cfw, right_cfw)
+            self.insert_at_position(key=(link, right_cfw, left_cfw), value={uuid}, position=position + 1)
+        else:
+            self.data_ordered[(link, right_cfw, left_cfw)].add(uuid)
+
+        # adjust self.data
+        self.data[(link, right_cfw, left_cfw)].add(uuid)
+
+        # drop the old link. however, as they are one object, we only need to drop it in one of data or data_ordered
+        self.data[(link, left_cfw, right_cfw)].remove(uuid)
+        if len(self.data[(link, left_cfw, right_cfw)]) == 0:
+            del self.data[(link, left_cfw, right_cfw)]
+            del self.data_ordered[(link, left_cfw, right_cfw)]
+
+    def get_position(self, link: Link, left_cfw: type[ComputeFramework], right_cfw: type[ComputeFramework]) -> int:
+        for i, (k, _) in enumerate(self.data_ordered.items()):
+            if k == (link, left_cfw, right_cfw):
+                return i
+
+        raise ValueError("Link not found in data ordered!")
+
+    def insert_at_position(self, key: LinkFrameworkTrekker, value: set[UUID], position: int) -> None:
+        items = list(self.data_ordered.items())
+        items.insert(position, (key, value))
+        self.data_ordered = OrderedDict(items)
+
+    def get_ordered_data(self) -> OrderedDict[LinkFrameworkTrekker, set[UUID]]:
+        """
+        We ensure that the data is ordered by the order of the links.
+        If we would have:
+
+        links = {Link("inner", left, right_1), Link("inner", right_1, right_2)}
+
+        This would result in the following order in creating the queue:
+             1.   (Link("inner", right_1, right_2): {uuid2}
+             2.   (Link("inner", left, right_1), left, right_1): {uuid1},
+        """
+
+        self.order_links_by_frameworks()
+        self.order_ordered_ids_by_relation()
+        self.create_data_ordered()
+        return self.data_ordered
+
+    def drop_dependency_in_case_of_circular_dependencies(self) -> None:
+        def adjust_order(data: dict[LinkFrameworkTrekker, set[UUID]], k_out: UUID, k_int: UUID) -> None:
+            found_out = None
+            found_in = None
+
+            for link_fw, dependant_features in data.items():
+                if link_fw[0].uuid == k_out:
+                    found_out = (k_out, dependant_features)
+
+                if link_fw[0].uuid == k_int:
+                    found_in = (k_in, dependant_features)
+
+            if found_out is None or found_in is None:
+                raise ValueError("Link not found in data!")
+
+            if len(found_out[1]) >= len(found_in[1]):
+                k_to_drop = found_out[0]
+                k_not_to_drop = found_in[0]
+            else:
+                k_to_drop = found_in[0]
+                k_not_to_drop = found_out[0]
+
+            for k_order, v_order in self.order.items():
+                if k_not_to_drop != k_order:
+                    continue
+
+                if k_to_drop in v_order:
+                    v_order.remove(k_to_drop)
+                    break
+
+        for k_out, v_out in self.order.items():
+            for k_in, v_in in self.order.items():
+                if k_out == k_in:
+                    continue
+
+                if k_out in v_in:
+                    if k_in in v_out:
+                        adjust_order(self.data, k_out, k_in)
+
+    def order_ordered_ids_by_relation(self) -> None:
+        """Stable topological sort (Kahn's algorithm), one id at a time: self.order[k] = {v, ...} means k must
+        precede each v; among all currently-ready ids, the one earliest in the original insertion order is always
+        placed next, a self-edge is a no-op, and any leftover cycle falls back to the original insertion order."""
+
+        ids: list[UUID] = list(self.order.keys())
+        id_set: set[UUID] = set(ids)
+
+        edges: dict[UUID, set[UUID]] = {
+            node: {v for v in self.order[node] if v in id_set and v != node} for node in ids
+        }
+
+        in_degree: dict[UUID, int] = dict.fromkeys(ids, 0)
+        for node in ids:
+            for v in edges[node]:
+                in_degree[v] += 1
+
+        placed: set[UUID] = set()
+        result: list[UUID] = []
+
+        while len(placed) < len(ids):
+            for node in ids:
+                if node in placed or in_degree[node] > 0:
+                    continue
+                result.append(node)
+                placed.add(node)
+                for v in edges[node]:
+                    in_degree[v] -= 1
+                break
+            else:
+                result.extend(node for node in ids if node not in placed)
+                break
+
+        self.order = OrderedDict((node, self.order[node]) for node in result)
+
+    def order_links_by_frameworks(self) -> None:
+        for trekker, uuids in self.data.items():
+            link = trekker[0]
+            left_framework = trekker[1]
+            right_framework = trekker[2]
+
+            for other_trekker, other_uuids in self.data.items():
+                other_link = other_trekker[0]
+                other_left_framework = other_trekker[1]
+                _ = other_trekker[2]
+
+                if link.uuid == other_link.uuid:
+                    continue
+
+                if right_framework == other_left_framework == left_framework:
+                    continue
+
+                if right_framework == other_left_framework:
+                    if other_link.uuid not in self.order:
+                        self.order[other_link.uuid] = {link.uuid}
+                    else:
+                        self.order[other_link.uuid].add(link.uuid)
+
+        self.drop_dependency_in_case_of_circular_dependencies()
+
+    def create_data_ordered(self) -> None:
+        # fill ordered dict by priority
+
+        for o_id, oo_uuids in self.order.items():
+            for k, v in self.data.items():
+                if k[0].uuid == o_id:
+                    self.data_ordered[k] = v
+
+        # fill rest independent of order
+        for k, v in self.data.items():
+            if k not in self.data_ordered:
+                self.data_ordered[k] = v
+
+        ResolveLinkValidator.validate_data_consistency(self.data, self.data_ordered)
+
+
+class ResolveLinks:
+    def __init__(self, graph: Graph, links: set[Link] | None = None) -> None:
+        self.graph = graph
+        self.links = links
+        self.link_trekker = LinkTrekker()
+        self.occurrences: list[tuple[Link, UUID, UUID, UUID]] = []
+
+    def add_links_to_queue(self) -> list[UUID | LinkFrameworkTrekker]:
+        queue = self.graph.queue
+
+        queue_with_link: list[UUID | LinkFrameworkTrekker] = []
+        already_joined: set[LinkFrameworkTrekker] = set()
+
+        ordered = self.link_trekker.get_ordered_data()
+
+        for uuid in queue:
+            for link, link_uuids in ordered.items():
+                if link in already_joined:
+                    continue
+
+                # Schedule before the first consumer or descendant of one, so a hop binding is not overwritten later.
+                if uuid in link_uuids or self.graph.parent_to_children_mapping.get(uuid, set()) & set(link_uuids):
+                    queue_with_link.append(link)
+                    already_joined.add(link)
+
+            queue_with_link.append(uuid)
+
+        return queue_with_link
+
+    def match_links(self) -> None:
+        self.graph.set_direct_parents_for_each_child()
+        self.graph.set_all_parents_for_each_child()
+        self.graph.set_root_parents_by_direct_()
+
+        self.go_through_each_child_and_its_parents_and_look_for_links()
+
+    def resolve_links(self) -> None:
+        """Build trekker keys from the chosen frameworks of each recorded occurrence."""
+        nodes = self.graph.get_nodes()
+        for link, left_uuid, right_uuid, child in self.occurrences:
+            key = self.create_link_trekker_key(
+                link,
+                nodes[left_uuid].feature.get_compute_framework(),
+                nodes[right_uuid].feature.get_compute_framework(),
+            )
+            self.set_link_trekker(key, child)
+        ResolveLinkValidator.validate_no_conflicting_join_types(self.link_trekker.data)
+
+    def get_link_trekker(self) -> LinkTrekker:
+        return self.link_trekker
+
+    def go_through_each_child_and_its_parents_and_look_for_links(self) -> None:
+        if not self.links:
+            return
+
+        for child, parents in self.graph.parent_to_children_mapping.items():
+            # A Link pinned on any one of the child's parent features governs the
+            # whole join for that feature-group pair, including the (by-key) index
+            # pair that carries no pin of its own.
+            pinned_links: list[Link] = []
+            for p in parents:
+                node = self.graph.get_nodes()[p]
+                if node.feature is not None and node.feature.link is not None:
+                    pinned_links.append(node.feature.link)
+
+            direct_parents = self.graph.parents_by_direct_.get(child, set())
+            closures = [{d} | self.graph.parent_to_children_mapping.get(d, set()) for d in direct_parents]
+
+            for parent_in in parents:
+                for parent_out in parents:
+                    if parent_in == parent_out:
+                        continue
+
+                    # Only the feature that brings both join sides together is bound to the link.
+                    reads_both = parent_in in direct_parents and parent_out in direct_parents
+                    if not reads_both and any(parent_in in c and parent_out in c for c in closures):
+                        continue
+
+                    r_left = self.graph.get_nodes()[parent_in]
+                    r_right = self.graph.get_nodes()[parent_out]
+                    left_fg = r_left.feature_group_class
+                    right_fg = r_right.feature_group_class
+
+                    # Two-pass matching: exact match first, then polymorphic
+                    matched_links = self._find_matching_links(
+                        left_fg,
+                        right_fg,
+                        r_right.feature,
+                        left_feature=r_left.feature,
+                        pinned_links=pinned_links,
+                    )
+
+                    for matched_link in matched_links:
+                        self.occurrences.append((matched_link, parent_in, parent_out, child))
+
+    def _find_matching_links(
+        self,
+        left_fg: type,
+        right_fg: type,
+        right_feature: Any = None,
+        left_feature: Any = None,
+        pinned_links: list[Link] | None = None,
+    ) -> list[Link]:
+        """Find all matching links using two-pass matching: exact first, then polymorphic.
+
+        Returns all exact matches if any exist, otherwise returns the most specific
+        polymorphic matches (closest in inheritance hierarchy).
+        """
+        if self.links is None:
+            return []
+
+        # Pass 1: Collect all exact matches
+        exact_matches = [link for link in self.links if link.matches_exact(left_fg, right_fg)]
+        if exact_matches:
+            candidates = exact_matches
+            if len(candidates) > 1:
+                # Narrow by right_index (preserve existing behavior).
+                if right_feature is not None:
+                    index_filtered = [
+                        link
+                        for link in candidates
+                        if right_feature.index is not None and link.right_index == right_feature.index
+                    ]
+                    if index_filtered:
+                        candidates = index_filtered
+
+                # Narrow by a Link pinned on either joining feature, or on any of
+                # the child's sibling parent features (a pin on one joining feature
+                # governs the whole feature-group-pair join).
+                pins = [
+                    f.link
+                    for f in (left_feature, right_feature)
+                    if f is not None and getattr(f, "link", None) is not None
+                ]
+                if pinned_links:
+                    pins.extend(pinned_links)
+                if pins:
+                    pinned = [link for link in candidates if any(link == p for p in pins)]
+                    if pinned:
+                        candidates = pinned
+
+                # Fail loud on residual ASOF ambiguity.
+                # Only the multi-ASOF case raises here: a residual mix of one ASOF + one
+                # non-ASOF candidate is intentionally NOT raised, since non-ASOF ambiguity is
+                # handled by the existing downstream join-type validation (preserves prior behavior).
+                if len(candidates) > 1:
+                    asof_candidates = [link for link in candidates if link.jointype == JoinType.ASOF]
+                    if len(asof_candidates) > 1:
+                        raise ValueError(
+                            f"Ambiguous ASOF links for ({left_fg.__name__}, {right_fg.__name__}): "
+                            f"{len(asof_candidates)} ASOF links share the same join key and cannot be "
+                            "auto-selected. Pin the intended link on the joining feature via "
+                            "Feature(..., link=<the Link>)."
+                        )
+            return candidates
+
+        # Pass 2: If no exact matches, find most specific polymorphic matches
+        polymorphic_matches = [link for link in self.links if link.matches_polymorphic(left_fg, right_fg)]
+        if not polymorphic_matches:
+            return []
+
+        # Find the most specific match (smallest inheritance distance)
+        return self._select_most_specific_links(polymorphic_matches, left_fg, right_fg)
+
+    def _inheritance_distance(self, child: type, parent: type) -> int:
+        return inheritance_distance(child, parent)
+
+    def _select_most_specific_links(self, links: list[Link], left_fg: type, right_fg: type) -> list[Link]:
+        """Select links that are most specific (closest in inheritance hierarchy).
+
+        For self-joins, requires balanced inheritance distance to prevent sibling mismatches.
+        For non-self-joins with unrelated classes, accepts asymmetric polymorphic+exact matches.
+        """
+        if not links:
+            return []
+
+        link_distances: list[tuple[Link, int]] = []
+        for link in links:
+            left_dist = self._inheritance_distance(left_fg, link.left_feature_group)
+            right_dist = self._inheritance_distance(right_fg, link.right_feature_group)
+
+            link_is_self_join = link.left_feature_group == link.right_feature_group
+
+            if link_is_self_join:
+                # For self-joins: require same concrete class and balanced inheritance
+                if left_fg == right_fg and left_dist == right_dist:
+                    link_distances.append((link, left_dist))
+            elif left_dist == right_dist:
+                # Balanced match (both exact or both polymorphic at same level)
+                link_distances.append((link, left_dist))
+            else:
+                # Check if asymmetric match is allowed
+                # Only allow when one side is exact (distance 0) AND
+                # the Link's classes are not related by inheritance
+                # (to prevent sibling class mismatches)
+                link_classes_related = issubclass(link.left_feature_group, link.right_feature_group) or issubclass(
+                    link.right_feature_group, link.left_feature_group
+                )
+                if not link_classes_related and (left_dist == 0 or right_dist == 0):
+                    max_dist = max(left_dist, right_dist)
+                    link_distances.append((link, max_dist))
+
+        if not link_distances:
+            return []
+
+        # Find minimum distance
+        min_dist = min(dist for _, dist in link_distances)
+
+        # Return all links with minimum distance
+        return [link for link, dist in link_distances if dist == min_dist]
+
+    def set_link_trekker(self, link_trekker_key: LinkFrameworkTrekker, uuid: UUID) -> None:
+        self.link_trekker.update(link_trekker_key, uuid)
+
+    @staticmethod
+    def create_link_trekker_key(
+        link: Link, left_framework: type[ComputeFramework], right_framework: type[ComputeFramework]
+    ) -> LinkFrameworkTrekker:
+        return (link, left_framework, right_framework)

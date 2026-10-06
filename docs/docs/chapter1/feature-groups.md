@@ -1,0 +1,96 @@
+### Creating a Custom Feature Group
+
+> **AI-Friendly Design:** Feature groups are small, template-like structures - easy to test, easy to debug, and easy for AI to generate. The declarative pattern makes them ideal for AI-assisted development.
+
+In this example, we'll create a custom feature group that multiplies the results of each feature by 2. We'll implement a new feature group and then use it within mloda.
+
+#### 1. Import the Required Modules and Set File References
+
+Start by importing the necessary modules to define the custom feature group and perform calculations:
+```python
+import pyarrow.compute as pc
+import pyarrow as pa
+
+from mloda.provider import FeatureGroup
+from mloda.user import DataAccessCollection
+
+file_path = "tests/test_plugins/feature_group/src/dataset/creditcard_2023_short.csv"
+data_access_collection = DataAccessCollection(files={file_path})
+
+feature_list = ["id","V1","V2","V3"]
+example_feature_list = [f"Example_{f}" for f in feature_list]
+
+```
+
+#### 2. Define the Feature Group
+The custom feature group, Example, operates on a set of input features. It depends on the root features (e.g., "id", "V1", etc.) and renames them with the prefix "Example_". 
+
+The calculation logic for multiplying each feature by 2 is implemented in the calculate_feature function.
+
+```python
+class Example(FeatureGroup):
+    def input_features(self, _, feature_name):
+        return {str(feature_name).split("_")[1]}
+
+    @classmethod
+    def calculate_feature(cls, data, _):
+        multiplied_columns = [pc.multiply(data[column], 2) for column in data.column_names]
+        col_names = [f"{cls.get_class_name()}_{col_names}" for col_names in data.column_names]
+        multiplied_table = pa.table(multiplied_columns, names=col_names)
+        return multiplied_table
+```
+
+#### 3. Execute the Request Using the New Feature Group
+To use the newly defined feature group, simply add the **"Example_"** prefix to each feature name. mloda will automatically resolve the dependency between the **CsvReader** and the **Example** feature group.
+
+```python
+from mloda.user import mloda
+
+result = mloda.run_all(
+            example_feature_list, 
+            compute_frameworks=["PyArrowTable"], 
+            data_access_collection=data_access_collection
+        )
+result[0]
+```
+Expected output:
+```text
+pyarrow.Table
+Example_V28: double
+Example_id: int64
+...
+Example_V28: [[-0.26000604758867731,-0.26311827417649086,-0....]]
+Example_id: [[0,2,4,...]]
+....
+```
+
+#### 4. Summary
+
+In this example, we implemented a custom feature group, Example, that multiplies each feature value by 2. By defining a straightforward input_features method and a calculate_feature method, we were able to extend mloda's feature engineering capabilities with custom transformations. We then executed the request by simply modifying the feature names with a prefix ("Example_"), allowing mloda to handle dependencies and computations automatically.
+
+#### 5. The result contract
+
+A feature group must return its **columns**, even when it has no rows. Zero rows
+is a valid result; zero columns is not, and raises `EmptyResultError`. On the
+PythonDict framework this means a row-oriented `[]` is *not* a valid empty
+result: return `{"my_feature": []}` instead, keeping the column and dropping the
+rows. See [Empty Result Handling](../in_depth/compute-framework-integration.md#empty-results).
+
+#### 6. Advanced Feature Group Topics
+
+For more in-depth information about feature groups, check out these advanced topics:
+
+- [Feature Chain Parser](../in_depth/feature-chain-parser.md) - How feature groups work with chained feature names
+- [Feature Group Matching](../in_depth/feature-group-matching.md) - How the system determines which feature group handles a feature
+- [Feature Group Testing](../in_depth/feature-group-testing.md) - Best practices for testing feature groups
+- [Feature Group Versioning](../in_depth/feature-group-version.md) - How versioning works in feature groups
+- [Compute Framework Integration](../in_depth/compute-framework-integration.md) - How feature groups integrate with compute frameworks
+- [Multiple Result Columns](../in_depth/multiple_result_columns.md) - Working with multi-column features using automatic discovery utilities
+- [Data Type Enforcement](../in_depth/data-type-enforcement.md) - Runtime validation of declared feature data types
+- [Filter Handling in FeatureGroups](../in_depth/filter_data.md#handling-filters-in-a-featuregroup) - Row elimination and `final_filters()`
+- [Mask Engine](../in_depth/mask_engine.md) - Inline masking with `features.mask_engine`
+- [Empty Result Handling](../in_depth/compute-framework-integration.md#empty-results) - Zero rows is always valid; a zero-column (schema-less) result raises `EmptyResultError`
+
+#### 7. Discovering Feature Groups
+
+To list all available feature groups and their documentation, use the `get_feature_group_docs()` function from `mloda.steward`.

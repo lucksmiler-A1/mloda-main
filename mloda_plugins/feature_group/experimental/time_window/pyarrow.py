@@ -1,0 +1,237 @@
+"""
+PyArrow implementation for time window feature groups.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+import bisect
+
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from mloda.core.optional_dependency import require
+from mloda.provider import ComputeFramework
+
+from mloda_plugins.compute_framework.base_implementations.pyarrow import pyarrow_type_semantics
+from mloda.user.pyarrow import PyArrowTable
+from mloda_plugins.feature_group.experimental.time_window.base import TimeWindowFeatureGroup
+
+_NUMPY_REASON = "multi-column time-window aggregation"
+
+
+class PyArrowTimeWindowFeatureGroup(TimeWindowFeatureGroup):
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PyArrowTable}
+
+    @classmethod
+    def _check_reference_time_column_exists(cls, data: pa.Table, reference_time_column: str) -> None:
+        """Check if the reference time column exists in the Table."""
+        if reference_time_column not in data.schema.names:
+            raise ValueError(
+                f"Reference time column '{reference_time_column}' not found in data. "
+                f"Please ensure the Table contains this column."
+            )
+
+    @classmethod
+    def _check_reference_time_column_is_datetime(cls, data: pa.Table, reference_time_column: str) -> None:
+        """Check if the reference time column is a datetime column."""
+        semantics = pyarrow_type_semantics.column_semantics(data, reference_time_column)
+        cls._validate_reference_time_column(semantics, reference_time_column)
+
+    @classmethod
+    def _get_available_columns(cls, data: pa.Table) -> set[str]:
+        """Get the set of available column names from the Table schema."""
+        return PyArrowTable.extract_column_names(data)
+
+    @classmethod
+    def _check_source_features_exist(cls, data: pa.Table, feature_names: list[str]) -> None:
+        """
+        Check if the resolved features exist in the Table.
+
+        Args:
+            data: The PyArrow Table
+            feature_names: List of resolved feature names (may contain ~N suffixes)
+
+        Raises:
+            ValueError: If none of the resolved features exist in the data
+        """
+        available_columns = cls._get_available_columns(data)
+        missing_features = [name for name in feature_names if name not in available_columns]
+        if len(missing_features) == len(feature_names):
+            raise ValueError(
+                f"None of the source features {feature_names} found in data. Available columns: {sorted(available_columns, key=str)}"
+            )
+
+    @classmethod
+    def _add_result_to_data(cls, data: pa.Table, feature_name: str, result: Any) -> pa.Table:
+        """Add the result to the Table."""
+        # Check if column already exists
+        if feature_name in data.schema.names:
+            # Column exists, replace it by removing the old one and adding the new one
+            column_index = data.schema.names.index(feature_name)
+            # Remove the existing column
+            data = data.remove_column(column_index)
+            # Add the new column
+            return data.append_column(feature_name, result)
+        else:
+            # Column doesn't exist, add it normally
+            return data.append_column(feature_name, result)
+
+    @classmethod
+    def _perform_window_operation(
+        cls,
+        data: pa.Table,
+        window_function: str,
+        window_size: int,
+        time_unit: str,
+        in_features: list[str],
+        time_filter_feature: str | None = None,
+    ) -> pa.Array:
+        """
+        Perform the time window operation using PyArrow compute functions.
+
+        Supports both single-column and multi-column window operations:
+        - Single column: aggregates values within the column over time
+        - Multi-column: aggregates across columns for each time window row
+
+        Args:
+            data: The PyArrow Table
+            window_function: The type of window function to perform
+            window_size: The size of the window
+            time_unit: The time unit for the window
+            in_features: List of source feature names (may be single or multiple columns)
+            time_filter_feature: The name of the time filter feature to use for time-based operations.
+                                If None, uses the value from get_reference_time_column().
+
+        Returns:
+            The result of the window operation as a PyArrow Array
+        """
+        # Use the default time filter feature if none is provided
+        if time_filter_feature is None:
+            time_filter_feature = cls.get_reference_time_column()
+
+        # Get the time column
+        time_column = data.column(time_filter_feature)
+
+        # A null/NaT reference time has no position on the timeline; fail explicitly.
+        if time_column.null_count > 0:
+            cls._raise_null_reference_time(time_filter_feature)
+
+        # Get the source columns
+        source_columns = [data.column(name) for name in in_features]
+
+        # Sort the data by time
+        # First create indices sorted by time
+        sorted_indices = pc.sort_indices(time_column)
+
+        # Get the sorted source values for each column
+        sorted_sources = [pc.take(col, sorted_indices) for col in source_columns]
+
+        # Time-based (not row-count) window: include rows in (t - span, t].
+        # Bound each window by ABSOLUTE integer nanoseconds (not Python datetimes):
+        # wall-clock datetime subtraction is wrong across a DST transition, whereas
+        # int64 ns since epoch is DST-safe, unit-uniform, and works for tz-aware
+        # timestamps and date32/date64 too.
+        sorted_times_ns = pc.take(time_column, sorted_indices).cast(pa.timestamp("ns")).cast(pa.int64()).to_pylist()
+        span = cls._get_time_delta(window_size, time_unit)
+        span_ns = span.days * 86_400_000_000_000 + span.seconds * 1_000_000_000 + span.microseconds * 1_000
+
+        # Create a list to store the results
+        results = []
+
+        numpy = require("numpy", _NUMPY_REASON) if len(in_features) > 1 else None
+
+        # For each row, calculate the window operation over the time-based window
+        for i in range(len(sorted_sources[0])):
+            # Rows are time-sorted ascending, so the window is a contiguous slice
+            # ending at i. bisect_right of (t_i - span) gives the first index strictly
+            # greater than the lower bound, implementing the left-open boundary.
+            start_idx = bisect.bisect_right(sorted_times_ns, sorted_times_ns[i] - span_ns)
+            length = i - start_idx + 1
+
+            # Zero-copy slice of each sorted source column for the current window.
+            all_window_values = [col.slice(start_idx, length) for col in sorted_sources]
+
+            # Apply the window function
+            if len(all_window_values[0]) == 0:
+                # If no values in window, use the current value
+                results.append(sorted_sources[0][i].as_py())
+            else:
+                # For multi-column, first compute rolling window per column, then aggregate across columns
+                column_results = [
+                    cls._window_scalar(window_values, window_function).as_py() for window_values in all_window_values
+                ]
+
+                # If multi-column, aggregate across columns
+                if len(in_features) > 1:
+                    assert numpy is not None
+                    np = numpy
+
+                    column_array = np.array(column_results)
+                    if window_function == "sum":
+                        results.append(np.sum(column_array))
+                    elif window_function == "min":
+                        results.append(np.min(column_array))
+                    elif window_function == "max":
+                        results.append(np.max(column_array))
+                    elif window_function in ["avg", "mean"]:
+                        results.append(np.mean(column_array))
+                    elif window_function == "count":
+                        results.append(np.sum(~np.isnan(column_array)))
+                    elif window_function == "std":
+                        results.append(np.std(column_array))
+                    elif window_function == "var":
+                        results.append(np.var(column_array))
+                    elif window_function == "median":
+                        results.append(np.median(column_array))
+                    elif window_function in ["first", "last"]:
+                        results.append(np.mean(column_array))  # Use mean as aggregation for first/last
+                else:
+                    # Single column: use the result directly
+                    results.append(column_results[0])
+
+        # Scatter results back to original row order via the inverse permutation (O(n)).
+        sorted_idx_list = sorted_indices.to_pylist()
+        reordered_results: list[Any] = [None] * len(results)
+        for k, orig_pos in enumerate(sorted_idx_list):
+            reordered_results[orig_pos] = results[k]
+
+        if not reordered_results:
+            # pa.array([]) infers the null type; take the type the window function yields on the empty source.
+            source = sorted_sources[0]
+            if window_function in ["first", "last"]:
+                return pa.array([], type=source.type)
+            return pa.array([], type=cls._window_scalar(source, window_function).type)
+
+        # Convert the results to a PyArrow array
+        return pa.array(reordered_results)
+
+    @classmethod
+    def _window_scalar(cls, window_values: pa.ChunkedArray, window_function: str) -> pa.Scalar:
+        """Apply the window function to one window of a single column, keeping the pyarrow result type."""
+        if window_function == "sum":
+            return pc.sum(window_values)
+        elif window_function == "min":
+            return pc.min(window_values)
+        elif window_function == "max":
+            return pc.max(window_values)
+        elif window_function in ["avg", "mean"]:
+            return pc.mean(window_values)
+        elif window_function == "count":
+            return pc.count(window_values)
+        elif window_function == "std":
+            return pc.stddev(window_values)
+        elif window_function == "var":
+            return pc.variance(window_values)
+        elif window_function == "median":
+            # PyArrow doesn't have a direct median function
+            # We can approximate it using quantile with q=0.5
+            return pc.quantile(window_values, q=0.5)[0]
+        elif window_function == "first":
+            return window_values[0]
+        elif window_function == "last":
+            return window_values[-1]
+        else:
+            raise ValueError(f"Unsupported window function: {window_function}")

@@ -1,0 +1,364 @@
+"""
+Tests for the prepare() / run() public API on mlodaAPI.
+
+These tests define the contract for a two-phase execution model:
+  1. prepare() - classmethod that builds the execution plan and returns a reusable mlodaAPI instance
+  2. run() - instance method that executes with fresh api_data, reusing the cached plan
+"""
+
+from typing import Any
+
+import pytest
+
+from mloda.core.abstract_plugins.function_extender import Extender, ExtenderHook
+from mloda.user import mloda, mlodaAPI, Feature, PluginCollector
+from mloda.provider import BaseInputData, ComputeFramework, DataCreator, FeatureGroup, FeatureSet, ApiInputDataFeature
+from mloda.user import Options, FeatureName, Index
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+
+
+class PrepareRunApiFeature(FeatureGroup):
+    """A simple feature that consumes api data for prepare/run tests."""
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
+        return {
+            Feature(name="api_id", index=Index(("api_id",))),
+            Feature(name="api_value", index=Index(("api_id",))),
+        }
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        data["PrepareRunApiFeature"] = data["api_id"].astype(str) + "_" + data["api_value"]
+        return data
+
+    @classmethod
+    def feature_names_supported(cls) -> set[str]:
+        return {cls.get_class_name()}
+
+
+_enabled = PluginCollector.enabled_feature_groups(
+    {
+        ApiInputDataFeature,
+        PrepareRunApiFeature,
+    }
+)
+
+
+class TestPrepareReturnsInstance:
+    """Test 1: prepare() returns an mlodaAPI instance."""
+
+    def test_prepare_returns_mloda_api_instance(self) -> None:
+        """Calling mlodaAPI.prepare() should return an mlodaAPI instance with a cached execution plan."""
+        api_data = {
+            "PrepareExample": {
+                "api_id": [1, 2, 3],
+                "api_value": ["a", "b", "c"],
+            }
+        }
+
+        features: list[Feature | str] = [Feature(name="PrepareRunApiFeature")]
+
+        session = mloda.prepare(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+            plugin_collector=_enabled,
+        )
+
+        assert isinstance(session, mlodaAPI)
+
+
+class TestRunReturnsResults:
+    """Test 2: run() returns a list of results."""
+
+    def test_run_returns_results(self) -> None:
+        """After prepare(), calling run() should execute the plan and return a list of results."""
+        api_data = {
+            "PrepareExample": {
+                "api_id": [1, 2, 3],
+                "api_value": ["a", "b", "c"],
+            }
+        }
+
+        features: list[Feature | str] = [Feature(name="PrepareRunApiFeature")]
+
+        session = mloda.prepare(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+            plugin_collector=_enabled,
+        )
+
+        result = session.run(api_data=api_data)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        df = result[0]
+        assert "PrepareRunApiFeature" in df.columns
+        assert len(df) == 3
+        assert df["PrepareRunApiFeature"].tolist() == ["1_a", "2_b", "3_c"]
+
+
+class TestRunMatchesRunAllOutput:
+    """Test 3: run() output matches run_all() output."""
+
+    def test_run_matches_run_all_output(self) -> None:
+        """The prepare()+run() path must produce the same results as run_all()."""
+        api_data = {
+            "PrepareExample": {
+                "api_id": [10, 20],
+                "api_value": ["x", "y"],
+            }
+        }
+
+        features: list[Feature | str] = [Feature(name="PrepareRunApiFeature")]
+
+        run_all_result = mloda.run_all(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+            plugin_collector=_enabled,
+        )
+
+        session = mloda.prepare(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+            plugin_collector=_enabled,
+        )
+        prepare_run_result = session.run(api_data=api_data)
+
+        assert len(run_all_result) == len(prepare_run_result)
+
+        df_run_all = run_all_result[0]
+        df_prepare_run = prepare_run_result[0]
+
+        assert df_run_all["PrepareRunApiFeature"].tolist() == df_prepare_run["PrepareRunApiFeature"].tolist()
+
+
+class TestMultipleSequentialRuns:
+    """Test 4: Multiple sequential runs with different api_data produce correct, independent results."""
+
+    def test_multiple_sequential_runs_with_different_api_data(self) -> None:
+        """prepare() once, then run() twice with different api_data.
+        Each run should produce results matching only its own input data.
+        """
+        initial_api_data = {
+            "PrepareExample": {
+                "api_id": [1],
+                "api_value": ["initial"],
+            }
+        }
+
+        features: list[Feature | str] = [Feature(name="PrepareRunApiFeature")]
+
+        session = mloda.prepare(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data=initial_api_data,
+            plugin_collector=_enabled,
+        )
+
+        first_api_data = {
+            "PrepareExample": {
+                "api_id": [1, 2],
+                "api_value": ["a", "b"],
+            }
+        }
+        first_result = session.run(api_data=first_api_data)
+
+        assert len(first_result) == 1
+        df_first = first_result[0]
+        assert df_first["PrepareRunApiFeature"].tolist() == ["1_a", "2_b"]
+
+        second_api_data = {
+            "PrepareExample": {
+                "api_id": [10, 20, 30],
+                "api_value": ["x", "y", "z"],
+            }
+        }
+        second_result = session.run(api_data=second_api_data)
+
+        assert len(second_result) == 1
+        df_second = second_result[0]
+        assert df_second["PrepareRunApiFeature"].tolist() == ["10_x", "20_y", "30_z"]
+
+
+class _RefuseSecondRunStartExtender(Extender):
+    """Raises from on_run_start on the second run only."""
+
+    raise_on_error = True
+
+    def __init__(self) -> None:
+        self.starts = 0
+
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def on_run_start(self, run: Any, plan: Any, steps: Any) -> None:
+        self.starts += 1
+        if self.starts == 2:
+            raise RuntimeError("refuse second run")
+
+
+def _rerun(session: Any, path: str, api_data: dict[str, Any]) -> None:
+    if path == "batch":
+        session.run(api_data=api_data)
+    else:
+        list(session.stream_run(api_data=api_data))
+
+
+class TestFailedRerunDoesNotExposeStaleResults:
+    """After a re-run raises, get_result()/get_artifacts() never return a previous run's data."""
+
+    _first = {"PrepareExample": {"api_id": [1, 2], "api_value": ["a", "b"]}}
+
+    def _prepare(self, function_extender: Any = None) -> Any:
+        features: list[Feature | str] = [Feature(name="PrepareRunApiFeature")]
+        return mloda.prepare(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data={"PrepareExample": {"api_id": [1], "api_value": ["initial"]}},
+            plugin_collector=_enabled,
+            function_extender=function_extender,
+        )
+
+    @pytest.mark.parametrize("path", ["batch", "stream"])
+    def test_rerun_failing_in_computation_hides_first_run_data(self, path: str) -> None:
+        session = self._prepare()
+        first = session.run(api_data=self._first)
+        assert first[0]["PrepareRunApiFeature"].tolist() == ["1_a", "2_b"]
+
+        bad = {"PrepareExample": {"api_id": [1, 2], "api_value": [3, 4]}}
+        with pytest.raises(TypeError):
+            _rerun(session, path, bad)
+
+        with pytest.raises(ValueError, match="No results found"):
+            session.get_result()
+
+    @pytest.mark.parametrize("path", ["batch", "stream"])
+    def test_rerun_refused_at_start_clears_previous_runner(self, path: str) -> None:
+        session = self._prepare(function_extender={_RefuseSecondRunStartExtender()})
+        session.run(api_data=self._first)
+
+        with pytest.raises(RuntimeError, match="refuse second run"):
+            _rerun(session, path, self._first)
+
+        with pytest.raises(ValueError, match="You need to run any run function beforehand."):
+            session.get_result()
+        with pytest.raises(ValueError, match="You need to run any run function beforehand."):
+            session.get_artifacts()
+
+
+class TestStepStateDoesNotLeakBetweenRuns:
+    """Test 5: Internal step state does not leak between runs."""
+
+    def test_step_state_does_not_leak_between_runs(self) -> None:
+        """prepare() once, run() twice with the same data.
+        Both runs must succeed and produce identical results.
+        If internal step state (e.g. step_is_done flags) leaked from the first run,
+        the second run would fail or produce wrong results.
+        """
+        api_data = {
+            "PrepareExample": {
+                "api_id": [5, 6],
+                "api_value": ["p", "q"],
+            }
+        }
+
+        features: list[Feature | str] = [Feature(name="PrepareRunApiFeature")]
+
+        session = mloda.prepare(
+            features,
+            compute_frameworks=[PandasDataFrame],
+            api_data=api_data,
+            plugin_collector=_enabled,
+        )
+
+        first_result = session.run(api_data=api_data)
+        second_result = session.run(api_data=api_data)
+
+        assert len(first_result) == 1
+        assert len(second_result) == 1
+
+        df_first = first_result[0]
+        df_second = second_result[0]
+
+        assert df_first["PrepareRunApiFeature"].tolist() == ["5_p", "6_q"]
+        assert df_second["PrepareRunApiFeature"].tolist() == ["5_p", "6_q"]
+        assert df_first["PrepareRunApiFeature"].tolist() == df_second["PrepareRunApiFeature"].tolist()
+
+
+_PFEXT_MARKER = "prepfallback051"
+
+
+class _PrepareRunExtenderFeatureGroup(FeatureGroup):
+    """Simple root feature group for pinning function_extender fallback between prepare() and run()."""
+
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({f"{_PFEXT_MARKER}_col"})
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {f"{_PFEXT_MARKER}_col": [1, 2, 3]}
+
+
+class _CalculateHookRecordingExtender(Extender):
+    """Counts FEATURE_GROUP_CALCULATE_FEATURE invocations it wraps."""
+
+    def __init__(self, priority: int = 100) -> None:
+        self.priority = priority
+        self.call_count = 0
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        self.call_count += 1
+        return func(*args, **kwargs)
+
+
+_pfext_enabled = PluginCollector.enabled_feature_groups({_PrepareRunExtenderFeatureGroup})
+
+
+class TestRunUsesSessionFunctionExtender:
+    """function_extender is session-level: set once at prepare(), reused by every run()."""
+
+    def test_run_fires_the_extender_passed_to_prepare(self) -> None:
+        recorder = _CalculateHookRecordingExtender()
+
+        session = mloda.prepare(
+            [Feature(f"{_PFEXT_MARKER}_col")],
+            compute_frameworks=["PythonDictFramework"],
+            plugin_collector=_pfext_enabled,
+            function_extender={recorder},
+        )
+        session.run()
+
+        assert recorder.call_count == 1
+
+
+class TestRunAndStreamRunRejectFunctionExtender:
+    """run()/stream_run() no longer accept function_extender; it is session-level, set only via prepare()."""
+
+    @pytest.mark.parametrize("name", ["run", "stream_run"])
+    def test_function_extender_kwarg_raises_type_error(self, name: str) -> None:
+        recorder = _CalculateHookRecordingExtender()
+
+        session = mloda.prepare(
+            [Feature(f"{_PFEXT_MARKER}_col")],
+            compute_frameworks=["PythonDictFramework"],
+            plugin_collector=_pfext_enabled,
+        )
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'function_extender'"):
+            getattr(session, name)(**{"function_extender": {recorder}})

@@ -1,0 +1,384 @@
+from __future__ import annotations
+
+import multiprocessing  # noqa: F401
+import threading
+import logging
+from dataclasses import replace
+from typing import Any, Callable
+from uuid import UUID, uuid4
+
+from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
+from mloda.core.abstract_plugins.components.utils import failure_report
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.function_extender import Extender, ExtenderHook
+from mloda.core.core.cfw_manager import CfwManager
+from mloda.core.core.step.feature_group_step import FeatureGroupStep
+from mloda.core.core.step.join_step import JoinStep
+from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
+from mloda.core.runtime.worker_manager import WorkerManager
+from mloda.core.runtime.worker.thread_worker import thread_worker
+from mloda.core.runtime.worker.multiprocessing_worker import worker
+
+logger = logging.getLogger(__name__)
+
+
+class ComputeFrameworkExecutor:
+    """
+    Manages compute framework initialization and step execution.
+
+    Extracted from Runner class to handle CFW lifecycle and step execution logic.
+    """
+
+    def __init__(
+        self,
+        cfw_register: CfwManager,
+        worker_manager: WorkerManager,
+        tfs_connection_map: dict[type[ComputeFramework], Any] | None = None,
+        function_extender: set[Extender] | None = None,
+        worker_extender_payload: bytes | None = None,
+        hook_extenders: dict[ExtenderHook, Extender] | None = None,
+    ) -> None:
+        """
+        Initialize the executor with dependencies.
+
+        Args:
+            cfw_register: The CFW manager for registering compute frameworks.
+            worker_manager: The worker manager for handling parallel execution.
+            tfs_connection_map: Setup-resolved map of destination CFW class to its
+                framework connection (e.g. duckdb.DuckDBPyConnection, sqlite3.Connection).
+                Engine builds this once from the DataAccessCollection at setup; the
+                executor only does a dict lookup per TFS step on the run path.
+            function_extender: The caller's extenders; a resident framework gets a read-only
+                copy at attach time.
+            worker_extender_payload: Pickled (extenders, hook table) snapshot for a framework dispatched
+                to a spawned worker. Never unpickled here; attached to the new instance as
+                `_pending_extender_payload` and materialized by `ComputeFramework.__setstate__`
+                only once the instance is actually unpickled in the worker.
+            hook_extenders: The run's hook table; a resident framework gets a read-only copy at attach time.
+        """
+        self.cfw_collection: dict[UUID, ComputeFramework] = {}
+        self.cfw_register = cfw_register
+        self.worker_manager = worker_manager
+        self.tfs_connection_map: dict[type[ComputeFramework], Any] = tfs_connection_map or {}
+        self.function_extender = function_extender
+        self.worker_extender_payload = worker_extender_payload
+        self.hook_extenders = hook_extenders
+        self._cfw_lock = threading.Lock()
+
+    def init_compute_framework(
+        self,
+        cf_class: type[ComputeFramework],
+        parallelization_mode: ParallelizationMode,
+        children_if_root: set[UUID],
+        uuid: UUID | None = None,
+    ) -> UUID:
+        """
+        Initializes a compute framework.
+
+        Returns:
+            The UUID of the compute framework.
+        """
+        # Re-checking cf_class.supported_parallelization_modes() here is defensive: no current
+        # call path can pass MULTIPROCESSING for a class that does not support it.
+        # The worker-bound payload is deferred, never unpickled here: materializing it in this
+        # (parent) process would run any extender's own __setstate__ (e.g. building a live handle)
+        # under the wrong pid, and a second unpickle in the worker would then silently skip it.
+        dispatched_to_worker = (
+            parallelization_mode is ParallelizationMode.MULTIPROCESSING
+            and ParallelizationMode.MULTIPROCESSING in cf_class.supported_parallelization_modes()
+        )
+        if dispatched_to_worker:
+            # Never the caller's own extender objects here; a payload (if any) is attached
+            # below, after construction, as the still-pickled _pending_extender_payload.
+            function_extender = None
+        else:
+            # Framework stays resident in this process: it receives read-only copies at attach time.
+            function_extender = self.function_extender
+
+        # init framework
+        new_cfw = cf_class(
+            parallelization_mode,
+            frozenset(children_if_root),
+            uuid or uuid4(),
+            function_extender=function_extender,
+        )
+        if dispatched_to_worker and self.worker_extender_payload is not None:
+            # Materialization happens only in ComputeFramework.__setstate__, once this instance is
+            # actually unpickled in the worker; never here in the parent that dispatches it.
+            new_cfw._pending_extender_payload = self.worker_extender_payload
+        if not dispatched_to_worker and self.hook_extenders is not None:
+            new_cfw._hook_extenders = self.hook_extenders
+        # replace() re-runs __post_init__, so each framework owns its carrier copy.
+        object.__setattr__(new_cfw, "run_context", replace(self.cfw_register.get_run_context()))
+        new_cfw._seal_extenders()
+
+        # add to register
+        self.cfw_register.add_cfw_to_compute_frameworks(new_cfw.get_uuid(), cf_class.get_class_name(), children_if_root)
+
+        # add to collection
+        self.cfw_collection[new_cfw.get_uuid()] = new_cfw
+
+        return new_cfw.get_uuid()
+
+    def add_compute_framework(
+        self,
+        step: Any,
+        parallelization_mode: ParallelizationMode,
+        feature_uuid: UUID,
+        children_if_root: set[UUID],
+    ) -> UUID:
+        """
+        Adds a compute framework to the CFW register and CFW collection.
+
+        Returns:
+            The UUID of the compute framework.
+        """
+        with self._cfw_lock:
+            cfw_uuid = self.cfw_register.get_cfw_uuid(step.compute_framework.get_class_name(), feature_uuid)
+            # if cfw does not exist, create a new one
+            if cfw_uuid is None:
+                cfw_uuid = self.init_compute_framework(step.compute_framework, parallelization_mode, children_if_root)
+
+            return cfw_uuid
+
+    def get_cfw(
+        self, compute_framework: type[ComputeFramework], feature_uuid: UUID, tfs_ids: set[UUID] | None = None
+    ) -> ComputeFramework:
+        """
+        Retrieves a compute framework based on its type and a feature UUID.
+
+        tfs_ids, when given, is tried first via get_unique_cfw_uuid: a bare feature_uuid lookup
+        cannot tell apart two same-class cfws with identical children_if_root (e.g. a root and a
+        back-hop into that same root's own framework), while tfs_ids carries the step's own-key
+        signal that can.
+
+        Args:
+            compute_framework: The type of compute framework to retrieve.
+            feature_uuid: The UUID of the feature associated with the compute framework.
+            tfs_ids: The step's own tfs_ids, tried first when given.
+        """
+        cfw_uuid: UUID | None = None
+        if tfs_ids:
+            cls_name = compute_framework.get_class_name()
+            # See CfwManager.resolve_cfw_uuid_by_tfs_ids for the shared fallback chain.
+            cfw_uuid = self.cfw_register.resolve_cfw_uuid_by_tfs_ids(cls_name, tfs_ids, feature_uuid)
+
+        if cfw_uuid is None:
+            cfw_uuid = self.cfw_register.get_initialized_compute_framework_uuid(
+                compute_framework, feature_uuid=feature_uuid
+            )
+        if cfw_uuid is None:
+            raise ValueError(f"cfw_uuid should not be none: {compute_framework}.")
+        return self.cfw_collection[cfw_uuid]
+
+    def _get_execution_function(
+        self, mode_by_cfw_register: set[ParallelizationMode], mode_by_step: set[ParallelizationMode]
+    ) -> Callable[[Any], None]:
+        """
+        Identifies the execution mode and returns the corresponding execute step function.
+
+        Returns:
+            The execute step function corresponding to the identified mode.
+        """
+        modes = mode_by_cfw_register.intersection(mode_by_step)
+
+        if ParallelizationMode.MULTIPROCESSING in modes:
+            return self.multi_execute_step
+        elif ParallelizationMode.THREADING in modes:
+            return self.thread_execute_step
+        return self.sync_execute_step
+
+    def prepare_execute_step(self, step: Any, parallelization_mode: ParallelizationMode) -> UUID:
+        """
+        Prepares a step for execution by initializing or retrieving the associated CFW.
+        """
+        cfw_uuid: UUID | None = None
+
+        if isinstance(step, FeatureGroupStep):
+            cls_name = step.compute_framework.get_class_name()
+            # See CfwManager.resolve_cfw_uuid_by_tfs_ids for the shared fallback chain: an
+            # already-established cfw the step's own output uuid already belongs to (e.g. a chained
+            # join's final destination) wins over creating a brand new, empty cfw for a step that
+            # really has an existing home.
+            resolved_uuid = self.cfw_register.resolve_cfw_uuid_by_tfs_ids(
+                cls_name, step.tfs_ids, step.features.any_uuid
+            )
+
+            if resolved_uuid is not None:
+                return resolved_uuid
+
+            feature_uuid = step.features.any_uuid
+
+            if feature_uuid is None:
+                raise ValueError(f"from_feature_uuid should not be none. {step, feature_uuid}")
+
+            cfw_uuid = self.add_compute_framework(step, parallelization_mode, feature_uuid, set(step.children_if_root))
+        elif isinstance(step, TransformFrameworkStep):
+            from_feature_uuid, from_cfw_uuid = None, None
+            for r_f in step.required_uuids:
+                from_cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), r_f)
+                if from_cfw_uuid:
+                    from_feature_uuid = r_f
+                    break
+
+            if from_feature_uuid is None or from_cfw_uuid is None:
+                raise ValueError(
+                    f"from_feature_uuid or from_cfw_uuid should not be none. {step, from_feature_uuid, from_cfw_uuid}"
+                )
+
+            if step.link_id:
+                childrens = {step.link_id}
+            elif step.private_copy:
+                childrens = set(step.copy_readers)
+            else:
+                from_cfw = self.cfw_collection[from_cfw_uuid]
+                childrens = set(from_cfw.children_if_root)
+
+            with self._cfw_lock:
+                cfw_uuid = self.init_compute_framework(step.to_framework, parallelization_mode, childrens, step.uuid)
+
+        elif isinstance(step, JoinStep):
+            cfw_uuid = self.cfw_register.get_cfw_uuid(
+                step.destination_framework.get_class_name(),
+                step.destination_hop_uuid or next(iter(step.destination_framework_uuids)),
+            )
+
+        if cfw_uuid is None:
+            raise ValueError(
+                internal_invariant_error(
+                    "cfw_uuid is None after processing step in prepare_execute_step.",
+                    f"step type={type(step).__name__}, step={step}",
+                    "The compute framework UUID must be resolved for every step type "
+                    "(FeatureGroupStep, TransformFrameworkStep, or JoinStep).",
+                )
+            )
+
+        return cfw_uuid
+
+    def prepare_tfs_right_cfw(self, step: TransformFrameworkStep) -> UUID:
+        """
+        Prepares the right CFW for a TransformFrameworkStep.
+        """
+        if step.source_framework_uuid:
+            cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), step.source_framework_uuid)
+        else:
+            # A subclass-clustered hop's required_uuids can name parents owned by different
+            # sibling steps/frameworks (see execution_plan.py), so try each until one resolves
+            # instead of picking an arbitrary, possibly-wrong member.
+            cfw_uuid = None
+            for candidate_uuid in step.required_uuids:
+                cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), candidate_uuid)
+                if cfw_uuid is not None:
+                    break
+
+        if cfw_uuid is None or isinstance(cfw_uuid, UUID) is False:
+            raise ValueError(
+                f"cfw_uuid should not be none in prepare_tfs: {step.from_framework.get_class_name()}, "
+                f"{step.source_framework_uuid or step.required_uuids}"
+            )
+
+        return cfw_uuid
+
+    def prepare_tfs_and_joinstep(self, step: Any) -> ComputeFramework | UUID | None:
+        """Resolve the source cfw for a transform or join step; a UUID when a worker owns the transform source."""
+        from_cfw: ComputeFramework | None = None
+        if isinstance(step, TransformFrameworkStep):
+            source_uuid = self.prepare_tfs_right_cfw(step)
+            if self.worker_manager.get_process_queues(source_uuid) is not None:
+                # A worker owns this source cfw; its data lives on the flight server, not here.
+                return source_uuid
+            from_cfw = self.cfw_collection[source_uuid]
+        elif isinstance(step, JoinStep):
+            # Both join sides are destination-framework cfws, whose modes kept this join in the
+            # parent, so neither can be worker-owned.
+            from_cfw_uuid = self.cfw_register.get_cfw_uuid(step.destination_framework.get_class_name(), step.uuid)
+
+            if from_cfw_uuid is None:
+                from_cfw_uuid = self.cfw_register.get_cfw_uuid(
+                    step.destination_framework.get_class_name(), next(iter(step.source_framework_uuids))
+                )
+
+            if from_cfw_uuid is None:
+                raise ValueError(
+                    f"from_cfw_uuid should not be none: {step.destination_framework.get_class_name()}, "
+                    f"join token {step.uuid}"
+                )
+
+            from_cfw = self.cfw_collection[from_cfw_uuid]
+        return from_cfw
+
+    def _bind_tfs_connection(self, step: Any, cfw_uuid: UUID) -> None:
+        """Bind the setup-resolved connection to a TFS destination CFW, if any.
+
+        No-op for non-TFS steps and for destinations whose framework has no entry
+        in `tfs_connection_map` (i.e. no connection was resolved at Engine setup).
+        """
+        if not isinstance(step, TransformFrameworkStep):
+            return
+        cfw = self.cfw_collection[cfw_uuid]
+        conn = self.tfs_connection_map.get(type(cfw))
+        if conn is not None and cfw.framework_connection_object is None:
+            cfw.set_framework_connection_object(conn)
+
+    def sync_execute_step(self, step: Any) -> None:
+        """
+        Executes a step synchronously.
+        """
+        cfw_uuid = self.prepare_execute_step(step, ParallelizationMode.SYNC)
+
+        self._bind_tfs_connection(step, cfw_uuid)
+
+        try:
+            from_cfw = self.prepare_tfs_and_joinstep(step) or None
+            cfw = self.cfw_collection[cfw_uuid]
+            step.execute(self.cfw_register, cfw, from_cfw=from_cfw)
+            step.step_is_done = True
+
+        except Exception as e:
+            msg, exc_info = failure_report(e)
+            self.cfw_register.set_error(msg, exc_info, exception=e)
+
+    def thread_execute_step(self, step: Any) -> None:
+        """
+        Executes a step in a separate thread.
+        """
+        cfw_uuid = self.prepare_execute_step(step, ParallelizationMode.THREADING)
+
+        self._bind_tfs_connection(step, cfw_uuid)
+
+        from_cfw = self.prepare_tfs_and_joinstep(step) or None
+
+        task = threading.Thread(
+            target=thread_worker,
+            args=(step, self.cfw_register, self.cfw_collection[cfw_uuid], from_cfw),
+        )
+
+        self.worker_manager.add_thread_task(task)
+
+    def multi_execute_step(self, step: Any) -> None:
+        """
+        Executes a step in a separate process.
+        """
+        cfw_uuid = self.prepare_execute_step(step, ParallelizationMode.MULTIPROCESSING)
+
+        from_cfw = None
+        if isinstance(step, TransformFrameworkStep):
+            from_cfw = self.prepare_tfs_right_cfw(step)
+
+        existing = self.worker_manager.get_process_queues(cfw_uuid)
+
+        if existing is None:
+            process, command_queue, result_queue = self.worker_manager.create_worker_process(
+                cfw_uuid,
+                worker,
+                (self.cfw_register, self.cfw_collection[cfw_uuid], from_cfw),
+            )
+        else:
+            process, command_queue, result_queue = existing
+
+        self.worker_manager.send_command(cfw_uuid, step)
+        # Track by step.get_result_uuid() (== step.uuid), the id a worker reports back via
+        # result_queue. get_uuids() returns feature uuids instead, a different namespace that
+        # made find_orphaned_steps flag every finished worker as still owing a result.
+        self.worker_manager.record_assignment(cfw_uuid, {step.get_result_uuid()})

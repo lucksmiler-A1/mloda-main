@@ -1,0 +1,48 @@
+"""
+Tests for feature configuration schema export utility.
+
+This module tests the schema export function that provides JSON Schema
+for the FeatureConfig model.
+"""
+
+from mloda.core.api.feature_config.models import feature_config_schema
+
+
+def test_feature_config_schema_structure() -> None:
+    """Test that feature_config_schema returns a valid JSON Schema structure."""
+    schema = feature_config_schema()
+
+    assert isinstance(schema, dict), "Schema should be a dictionary"
+
+    assert "properties" in schema, "Schema should have 'properties' key"
+    assert "type" in schema, "Schema should have 'type' key"
+    assert "required" in schema, "Schema should have 'required' key"
+
+    assert "name" in schema["properties"], "'name' should be in schema properties"
+    assert "name" in schema["required"], "'name' should be in required fields"
+
+
+def test_feature_config_schema_forbids_additional_properties() -> None:
+    """Test that the schema forbids unknown keys (issue #680).
+
+    FeatureConfig enforces this at the top level and, once the nested in_features
+    dict is validated through FeatureConfig too, at every nesting level.
+    """
+    schema = feature_config_schema()
+
+    assert schema["additionalProperties"] is False, "Unknown config keys must not be allowed"
+
+
+def test_feature_config_schema_includes_propagate_context_keys() -> None:
+    """Test that the schema advertises the propagate_context_keys field.
+
+    The schema should expose propagate_context_keys as an array of strings so
+    that the documented configuration field is discoverable.
+    """
+    schema = feature_config_schema()
+
+    assert "propagate_context_keys" in schema["properties"], "'propagate_context_keys' should be in schema properties"
+
+    prop = schema["properties"]["propagate_context_keys"]
+    assert prop["type"] == "array", "'propagate_context_keys' should be an array"
+    assert prop["items"] == {"type": "string"}, "'propagate_context_keys' items should be strings"

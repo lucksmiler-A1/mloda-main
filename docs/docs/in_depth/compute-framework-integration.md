@@ -1,0 +1,363 @@
+# Feature Group Compute Framework Integration
+
+## Overview
+
+One of mloda's key strengths is its ability to decouple feature definitions from specific computation technologies. This document explains how feature groups integrate with different compute frameworks.
+
+## Core Concepts
+
+### Compute Framework Specification
+
+Feature groups specify which compute frameworks they support through the `compute_framework_rule` method:
+
+```py
+@classmethod
+def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+    """Define the compute frameworks this feature group supports."""
+    return {PandasDataFrame}  # Support only Pandas
+    # Or return True to support all available compute frameworks
+```
+
+### Declaring an Operation Unsupported on a Framework
+
+`compute_framework_rule` is a static, class-level set: it cannot say "this
+feature group runs on SQLite in general, but *this particular operation* is
+unsupported there." For that, override `supports_compute_framework`, a
+per-feature hook evaluated at match time:
+
+```py
+@classmethod
+def supports_compute_framework(cls, feature_name, options, compute_framework) -> bool:
+    """Reject an operation on a specific framework. Default returns True."""
+    if compute_framework is SqliteFramework and is_median_op(feature_name, options):
+        return False  # median is unsupported on SQLite
+    return True
+```
+
+Returning `False` removes that framework from the candidate set **for this
+feature only**:
+
+- If another framework can still run the operation, the matcher routes around
+  the rejected one silently (no error).
+- If the only remaining candidate is the rejected framework (for example, the
+  user pinned the feature to it), resolution fails with the standard
+  "No feature groups found" error, which names the near-miss feature group and
+  why it dropped, one line per eliminated candidate under a
+  "Feature group(s) eliminated while matching '...'" block, e.g.
+
+```
+No feature groups found for feature name: 'X'.
+Feature group(s) eliminated while matching 'X':
+  - MedianFeatureGroup (compute framework pin): pinned compute framework 'SqliteFramework' is not among its supported ['DuckDBFramework', 'PandasDataFrame']
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+The rejected framework is named as a near-miss with its reason rather than
+vanishing into a generic "unknown feature" message. Prefer this hook over
+raising a generic error from inside `calculate_feature`: the rejection happens
+during planning rather than at compute time, and the message is built for you.
+
+The debug inspector `resolve_feature(name)` reflects the hook too, because it
+runs the **same matcher over the same candidate universe as the engine** (it
+delegates to `IdentifyFeatureGroupClass`). Its `ResolvedFeature` result carries
+`supported_compute_frameworks` and `unsupported_compute_frameworks` (evaluated
+under default options unless you pass `options=`, see
+[Discover Plugins](discover-plugins.md)).
+
+Two distinct gaps both resolve to `feature_group=None` rather than appearing
+runnable:
+
+- **Unsupported on every framework.** The feature matches a group, but
+  `supports_compute_framework` rejects every installed framework. Resolution
+  fails with the capability error above.
+- **Uninstalled framework.** The only framework a matching group declares is not
+  installed (its backend library is absent, so `is_available()` is `False`). The
+  candidate universe drops unavailable frameworks before matching, so the group
+  maps to an empty framework set and resolution fails closed with the ordinary
+  `No feature groups found for feature name: '<name>'.` error. It does **not**
+  read as runnable on a framework you cannot actually run.
+
+### Declaring capability per subtype
+
+Families with multiple subtypes declare per-backend capability as data
+instead of a hand-written `supports_compute_framework`.
+
+**The data provider** declares the dimension once with `SUBTYPES`:
+
+```py
+class RankFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+    SUBTYPES = SubtypeDeclaration(
+        key="rank_type",
+        parametric_families={"ntile": "N-tile bucketing"},
+        supported={"PythonDictFramework": {"dense", "ordinal"}},
+    )
+    PREFIX_PATTERN = r".*__(?P<rank_type>[\w]+)_rank$"
+    PROPERTY_MAPPING = {
+        "rank_type": property_spec(
+            "Rank subtype.",
+            strict=True,
+            allowed_values={"dense": "Dense ranking", "ordinal": "Ordinal ranking"},
+        ),
+    }
+```
+
+Two shapes, enforced at class definition; a half declaration fails at import:
+
+- Shape A: `key` names a `PROPERTY_MAPPING` key with an enumerable value
+  space; `parametric_families` join the universe by family name.
+- Shape B (multi-axis families collapsed into one subtype id): declare the
+  universe explicitly with a resolver:
+
+```py
+def resolve_window(feature_name: str, options: Options) -> str | None:
+    return options.get("window_function")
+
+SUBTYPES = SubtypeDeclaration(universe={"median", "sum"}, resolver=resolve_window)
+```
+
+`supported` is a sparse per-framework override: frameworks absent from it
+keep the full universe. A key naming no declared framework is a silent no-op
+for matching but raises from `subtype_support_matrix()`, so a typo surfaces
+as `subtype_error` in the audit. The derived
+`supports_compute_framework` canonicalizes parametric instances (`ntile_2`
+becomes `ntile`) and gates declared subtypes by the declaration; undeclared
+subtypes and features without one stay open.
+
+**The data steward** audits capability via `subtype_support_matrix()`
+(supported subtypes per framework from `compute_framework_definition()`;
+empty for abstract bases) and `get_feature_group_docs()` (`subtype_key`,
+`subtypes`, `parametric_subtypes`, `subtype_support`, `subtype_error`). A
+hand-overridden `supports_compute_framework` yields no declared matrix; the
+misfit surfaces as `subtype_error`.
+
+**The data user** sees the outcome on `resolve_feature(name, options=...)`:
+`subtype` (e.g. `ntile_2`) and `subtype_family` (`ntile`, parametric
+instances only).
+
+### Empty Results
+
+The contract is: a **final** requested feature must return a *schema-bearing*
+result, meaning at least one column. **Zero rows is a valid result; zero columns
+is not.** A filter that excludes every row, a join with no matches, or a time
+window with no events all return a well-typed frame with the right columns and
+no rows, and mloda passes these through unchanged.
+
+The error fires only when a final requested result carries *no schema at all*. If
+`calculate_feature` produces a result with no columns,
+`ComputeFramework.run_validate_output_features` raises:
+
+```
+EmptyResultError: Result carries no schema (no columns): <FeatureGroupClassName>. ...
+```
+
+`EmptyResultError` is a `ValueError` subclass and is importable from the public
+API: `from mloda.provider import EmptyResultError`. Intermediate feature groups
+(those whose output feeds another feature group rather than the caller directly)
+are never subject to this check.
+
+#### The schema-presence gate
+
+The guard detects a missing schema via the framework's existing
+`ComputeFramework.extract_column_names(data) -> set[str]` (a classmethod): an empty set
+means no schema, which is the error condition. Every framework already implements
+this off schema metadata, so it works on a zero-row frame and costs nothing extra
+(no row scan, collect, or count). No per-framework opt-in is needed when you
+implement a new compute framework, as long as `extract_column_names` returns the
+columns for a zero-row frame. Feature groups can call
+`<Framework>.extract_column_names(data)` without an instance to resolve available columns.
+
+There is one representational caveat. The schema-bearing frameworks (PyArrow,
+Pandas, Polars, DuckDB, SQLite, Spark, Iceberg) carry their schema as metadata
+even at zero rows, so a zero-row result keeps its columns and passes. The
+PythonDict framework represents data as a columnar `dict[str, list]`, where the
+schema is the set of keys and is present even at zero rows: `{"col": []}` is a
+valid schema-bearing zero-row frame, while `{}` (zero columns) is the only
+schema-less value. Emptiness is judged purely on schema presence, with no
+opt-in: a zero-column result raises `EmptyResultError` uniformly on every
+framework. One consequence: on a schema-less result (a zero-column frame),
+column selection returns the result as is, so a misspelled requested column on
+schema-less data does not produce a "column not found" error.
+
+#### Filter column validation
+
+`_validate_filter_columns` skips its column-presence and dtype checks only when
+the data is the schema-less empty result (in practice PythonDict's `{}`).
+Filtering an empty result is a no-op, so neither the column check nor row
+elimination has anything to do. Data on which the framework cannot see columns
+but that is not an empty result still fails the missing-filter-column check
+loudly.
+
+### Column name case sensitivity
+
+mloda matches column and feature names exactly (case-sensitive) in every lookup, match and presence check; engines that resolve names differently add the rules below.
+
+-   DuckDB and SQLite compare identifiers ignoring ASCII case only (`val` and `VAL` are one column; `é` and `É` are two), and mloda's checks for new and helper column names fold case the same way. A join, as-of merge, union, append, `from_arrow` or `from_dict` whose output names differ only in case, or repeat a name exactly, raises `ValueError`; rename one side upstream.
+-   On those engines, mask primitives, the `partition_by` / `order_by` columns of `with_row_number` / `window`, merge keys, as-of `by` and time columns, `select` names and SQLite `order` names must be exact column names. SQLite also accepts its `rowid` / `oid` / `_rowid_` pseudo-columns in `select`, `order`, `with_row_number` and `window`. Raw SQL fragments (`filter` conditions, `project` expressions, the `window` function, DuckDB `order`) bind through the engine and stay case-insensitive; on SQLite an unresolvable quoted name there is read as a string literal, not an error.
+-   Spark column resolution follows `spark.sql.caseSensitive` (default `false`, folding like Python's `str.lower`, Unicode included). The Spark as-of merge and adding a feature column in `transform` raise `ValueError` on names that collide under that setting; Spark joins, union and append are not checked. Spark as-of time columns must match exactly; other Spark lookups (keys, masks, filters) bind through Spark's resolver.
+
+### Row count for observability
+
+`ComputeFramework._row_count(self, data) -> int | None` supplies the row counts extenders read
+off `HookContext` (`rows_in`/`rows_out`) on the `FEATURE_GROUP_CALCULATE_FEATURE` and
+`INPUT_DATA_LOAD` hooks (see [Extender](../chapter1/extender.md)). The default,
+`HookContext.row_count(data)`, is a best-effort `len(data)` that already counts a columnar
+`dict[str, list]` by its first column, so `PythonDictFramework` needs no override. Override
+`_row_count` only when the native type's `__len__` is missing, wrong, or would materialize or
+query the data: `DuckDBFramework` and `SqliteFramework` both return `None` for their relation
+objects, since `len()` on either runs a real `COUNT(*)` query rather than reading metadata.
+
+### Timezone and unit validation (merge and filter engines)
+
+A custom compute framework's merge and filter engines can opt into the
+[comparison contract](comparison-contract.md), which rejects incompatible
+timezone/unit combinations in equi-joins, as-of joins, and datetime filter bounds.
+The guard is **opt-in**: set `provides_column_semantics = True` on your
+`BaseMergeEngine` / `BaseFilterEngine` subclass and implement
+`_column_semantics(data, column)` to report the column's native semantics. Leave the
+flag at its default `False` (for a framework with no temporal intent) and the guard
+is skipped entirely, so you are never forced to implement the hook. An engine that
+opts in but forgets the hook raises a clear error rather than silently skipping
+validation. As-of joins always require `_column_semantics` regardless of the flag,
+since ordered time columns are intrinsic to the operation.
+
+### Framework-Specific Implementations
+
+Feature groups follow a layered architecture:
+- Base class defines the interface and common functionality
+- Framework-specific classes implement the actual calculations
+
+```
+FeatureGroup
+  └── BaseFeatureGroup (e.g., SegmentationFeatureGroup)
+        ├── PandasImplementation
+        ├── PyArrowImplementation
+        └── PythonDictFrameworkImplementation
+```
+
+## Implementation Pattern
+
+### 1. Base Class
+
+The base class defines the interface and common functionality:
+
+```py
+class MyFeatureGroup(FeatureGroup):
+    """Base class for MyFeatureGroup."""
+    
+    def input_features(self, options, feature_name):
+        # Common logic for extracting input features
+        
+    @classmethod
+    def calculate_feature(cls, data, features):
+        # This will be overridden by framework-specific implementations
+        raise NotImplementedError()
+```
+
+### 2. Framework-Specific Implementation
+
+Each framework-specific implementation:
+- Specifies which compute frameworks it supports
+- Implements the calculation logic for that framework
+
+```py
+class PandasMyFeatureGroup(MyFeatureGroup):
+    @classmethod
+    def compute_framework_rule(cls):
+        """Define supported compute frameworks."""
+        return {PandasDataFrame}
+    
+    @classmethod
+    def calculate_feature(cls, data, features):
+        """Implement calculation using pandas."""
+        # Pandas-specific implementation
+```
+
+## Framework Selection Process
+
+mloda picks one compute framework per step group (the features of one FeatureGroup that run as one step) in one planning step, before link joins are resolved.
+
+- **Allowed set**: the framework must fit the FeatureGroup (`compute_framework_rule`, `supports_compute_framework`), any pin via `Feature(compute_framework=...)`, and the run's enabled frameworks.
+- **Connection skip**: a `REQUIRED` framework is skipped for an unpinned feature whose options carry no connection under its FeatureGroup class name, unless no other framework fits. It is kept when every parent can run on that framework, because the step then uses the connection its input data carries. Parents carrying different connections keep the step off that framework. It is also kept when the feature has parents and the DataAccessCollection holds exactly one matching connection. A connection alone does not select DuckDB or SQLite: pin the feature or restrict the run with `compute_frameworks=[DuckDBFramework]`.
+- **Joins**: a link's child runs on one of its two sides. RIGHT joins run on the right side's framework, unless the consumers cannot run there, then on the left side's (only for links joining two different FeatureGroups). APPEND and UNION on the left. Children of one link agree on the side.
+- **Filters**: a filter pinned to a framework moves its host feature onto that framework.
+- **Conversions**: a transformer chain must exist between every parent and child on different frameworks.
+- **Choice among valid plans**: lowest cost first (one point per conversion), then the order of the run's `compute_frameworks` list, then the default order. The default order puts Pandas, Polars, PyArrow before `SELF_MANAGED` frameworks (Spark, Iceberg), before `REQUIRED` ones (DuckDB, SQLite), then class name.
+- **Reason**: each step records why it got its framework: `pinned`, `only allowed framework`, `rules exclude preferred frameworks`, `saves N conversion(s)`, `your list order` or `default order`. "saves N conversions" counts the conversions added by moving only that step to a preferred framework.
+- **Equal-cost plans**: blocks are settled in a fixed order (by FeatureGroup and feature names), each taking the most preferred framework still possible.
+- **Both ways**: a Polars-only consumer pulls its unrestricted source onto Polars, and a Polars-only source pulls its unrestricted consumers, so no transform step is needed.
+- **No valid plan**: planning raises an error naming the features and their allowed sets.
+
+List order is a tie-break after cost, not "first listed wins". To force a framework, pin the feature or restrict the run's list.
+
+`Feature.get_compute_framework()` returns the chosen framework. On a feature that allows several frameworks and was never planned, it raises.
+
+Framework authors declare the connection rule by overriding `connection_requirement()` (default `ConnectionRequirement.NONE`). A `REQUIRED` framework also overrides `connection_of(data)` to return the connection its native data carries, so a step after a parent on the same framework needs no connection of its own.
+
+## Data Transformation
+
+When data needs to move between compute frameworks:
+
+1. The `transform` method converts data between frameworks
+2. Each framework defines how to transform data to and from other frameworks
+3. The system automatically handles these transformations when needed
+
+For more details on how data transformation works between compute frameworks, see [Framework Transformers](framework-transformers.md).
+
+## Framework Notes
+
+- **DuckDB**: a FeatureGroup step gets its connection object from the feature's options under the FeatureGroup class name, or from the relation its parents hand in (the data access collection supplies it only to transform steps); mloda validates it and pins its session timezone to UTC but never opens or closes it. A transform into DuckDB or SQLite needs a matching connection in the DataAccessCollection, otherwise planning (prepare, explain, run_all) fails with an error naming the step. It runs in SYNC mode only, so its steps stay in the parent process under a MULTIPROCESSING run.
+- **Spark**: requires PySpark and a Java 17+ runtime (`JAVA_HOME`). mloda can auto-create a local `SparkSession`; for production, supply a configured one through the data access collection. The session stays in the parent process, so Spark steps run in SYNC or THREADING mode, never in a multiprocessing worker; Spark's own distributed processing covers scale-out.
+- **Iceberg**: needs a catalog supplied through the data access collection. The catalog stays in the parent process, so Iceberg steps run in SYNC or THREADING mode, never in a multiprocessing worker.
+
+A run requesting only `{ParallelizationMode.MULTIPROCESSING}` drops these frameworks at setup; a run left with no usable framework, or a feature pinned to a dropped one, raises. Request `{SYNC, MULTIPROCESSING}` or `{THREADING, MULTIPROCESSING}` to combine them with worker-dispatched frameworks.
+
+## SQL Relation Helpers (DuckDB / SQLite)
+
+The DuckDB and SQLite frameworks expose a relation object (`DuckdbRelation`, `SqliteRelation`) inside `calculate_feature`. Both share the same helper surface so a feature group can be written once against either.
+
+### Reading column types
+
+The `.types` property returns column types aligned with `.columns`. The element type differs by backend:
+
+- `DuckdbRelation.types` returns DuckDB-native dtype objects.
+- `SqliteRelation.types` returns PyArrow `pa.DataType` objects (from propagated hints, falling back to SQLite affinity inference).
+
+```py
+relation.columns   # ["user_id", "amount"]
+relation.types     # backend-specific dtype objects, same order as columns
+```
+
+### Window functions
+
+`with_row_number` appends a `ROW_NUMBER()` column; `window` appends an arbitrary window expression. Both quote every identifier and raise `ValueError` if the new `alias` collides with an existing column (the comparison ignores ASCII case) or if a `partition_by` / `order_by` column is not an exact column name.
+
+```py
+from mloda_plugins.compute_framework.base_implementations.sql.sql_window import (
+    OrderBy,
+    WindowFrame,
+    Preceding,
+    CurrentRow,
+)
+
+# ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts)
+ranked = relation.with_row_number(
+    "rn",
+    partition_by=["user_id"],
+    order_by=[OrderBy("ts")],
+)
+
+# SUM(amount) OVER (PARTITION BY user_id ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+rolling = relation.window(
+    "SUM(amount)",
+    "amount_rolling",
+    partition_by=["user_id"],
+    order_by=[OrderBy("ts")],
+    frame=WindowFrame(kind="rows", start=Preceding(2), end=CurrentRow()),
+)
+```
+
+`order_by` accepts plain column-name strings or `OrderBy(column, descending=..., nulls="first"|"last")`. The `func` passed to `window` is inlined verbatim as raw SQL, so never build it from user-controlled input.
+
+!!! warning "SQLite version requirement"
+    On SQLite, `with_row_number` and `window` require SQLite >= 3.28.0; using `NULLS` placement in `order_by` additionally requires SQLite >= 3.30.0. Both raise `ValueError` on older runtimes. DuckDB has no such gate.

@@ -1,0 +1,373 @@
+"""
+Tests for base SklearnPipelineFeatureGroup.
+"""
+
+import pytest
+from unittest.mock import Mock, patch
+from mloda_plugins.feature_group.experimental.sklearn.pipeline.base import SklearnPipelineFeatureGroup
+from mloda_plugins.feature_group.experimental.sklearn.pipeline.pandas import PandasSklearnPipelineFeatureGroup
+from mloda.provider import DefaultOptionKeys
+from mloda.user import Feature
+from mloda.user import FeatureName
+from mloda.user import Options
+
+
+class TestSklearnPipelineFeatureGroup:
+    """Test cases for SklearnPipelineFeatureGroup."""
+
+    def test_match_feature_group_criteria_valid_names(self) -> None:
+        """Test that valid feature names match the criteria."""
+        valid_names = [
+            "raw_features__sklearn_pipeline_preprocessing",
+            "income__sklearn_pipeline_scaling",
+            "customer_data__sklearn_pipeline_feature_engineering",
+            "missing_data__sklearn_pipeline_imputation",
+        ]
+
+        for name in valid_names:
+            assert SklearnPipelineFeatureGroup.match_feature_group_criteria(name, Options({})), (
+                f"Feature name '{name}' should match criteria"
+            )
+
+    def test_match_feature_group_criteria_invalid_names(self) -> None:
+        """Test that invalid feature names don't match the criteria."""
+        invalid_names = [
+            "raw_features__sklearn_preprocessing",  # Missing 'pipeline'
+            "raw_features__pipeline_preprocessing",  # Missing 'sklearn'
+            "raw_features__sklearn_pipeline",  # Missing pipeline name
+            "sklearn_pipeline_preprocessing",  # Missing source features
+            "other_feature_name",  # Completely different pattern
+            "",  # Empty string
+        ]
+
+        for name in invalid_names:
+            assert not SklearnPipelineFeatureGroup.match_feature_group_criteria(name, Options({})), (
+                f"Feature name '{name}' should not match criteria"
+            )
+
+    def test_get_pipeline_name(self) -> None:
+        """Test extraction of pipeline name from feature name."""
+        test_cases = [
+            ("raw_features__sklearn_pipeline_preprocessing", "preprocessing"),
+            ("income__sklearn_pipeline_scaling", "scaling"),
+            ("customer_data__sklearn_pipeline_feature_engineering", "feature_engineering"),
+            ("missing_data__sklearn_pipeline_imputation", "imputation"),
+        ]
+
+        for feature_name, expected_pipeline_name in test_cases:
+            result = SklearnPipelineFeatureGroup.get_pipeline_name(feature_name)
+            assert result == expected_pipeline_name
+
+    def test_get_pipeline_name_invalid(self) -> None:
+        """Test that invalid feature names raise ValueError."""
+        invalid_names = [
+            "raw_features__sklearn_preprocessing",
+            "invalid_feature_name",
+            "",
+        ]
+
+        for name in invalid_names:
+            with pytest.raises(ValueError, match="Invalid sklearn pipeline feature name format"):
+                SklearnPipelineFeatureGroup.get_pipeline_name(name)
+
+    def test_input_features_single_source(self) -> None:
+        """Test input_features method with single source feature."""
+        feature_name = FeatureName("raw_features__sklearn_pipeline_preprocessing")
+        options = Options({})
+
+        result = PandasSklearnPipelineFeatureGroup().input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 1
+        feature_names = [f.name for f in result]
+        assert "raw_features" in feature_names
+
+    def test_input_features_multiple_sources(self) -> None:
+        """Test input_features method with multiple source features."""
+        feature_name = FeatureName("income,age,salary__sklearn_pipeline_scaling")
+        options = Options({})
+
+        result = PandasSklearnPipelineFeatureGroup().input_features(options, feature_name)
+
+        assert result is not None
+        assert len(result) == 3
+        feature_names = [f.name for f in result]
+        assert "income" in feature_names
+        assert "age" in feature_names
+        assert "salary" in feature_names
+
+    @pytest.mark.parametrize("name", ["a,b__sklearn_pipeline_scaling", "a, b__sklearn_pipeline_scaling"])
+    def test_input_features_agree_with_the_mixin_source_extraction(self, name: str) -> None:
+        result = PandasSklearnPipelineFeatureGroup().input_features(Options({}), FeatureName(name))
+
+        assert result is not None
+        assert sorted(f.name for f in result) == sorted(
+            SklearnPipelineFeatureGroup._extract_source_features(Feature(name))
+        )
+
+    def test_input_features_keep_the_space_after_a_comma(self) -> None:
+        name = "a, b__sklearn_pipeline_scaling"
+        result = PandasSklearnPipelineFeatureGroup().input_features(Options({}), FeatureName(name))
+
+        assert result is not None
+        assert {str(f.name) for f in result} == {"a", " b"}
+        assert set(SklearnPipelineFeatureGroup._extract_source_features(Feature(name))) == {"a", " b"}
+
+    def test_create_default_pipeline_config_preprocessing(self) -> None:
+        """Test default pipeline configuration for preprocessing."""
+        # Skip test if sklearn not available
+        try:
+            SklearnPipelineFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        config = SklearnPipelineFeatureGroup._create_default_pipeline_config("preprocessing")
+
+        assert "steps" in config
+        assert "params" in config
+        assert len(config["steps"]) == 2
+
+        # Check step names
+        step_names = [step[0] for step in config["steps"]]
+        assert "imputer" in step_names
+        assert "scaler" in step_names
+
+    def test_create_default_pipeline_config_scaling(self) -> None:
+        """Test default pipeline configuration for scaling."""
+        # Skip test if sklearn not available
+        try:
+            SklearnPipelineFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        config = SklearnPipelineFeatureGroup._create_default_pipeline_config("scaling")
+
+        assert "steps" in config
+        assert "params" in config
+        assert len(config["steps"]) == 1
+
+        # Check step name
+        step_names = [step[0] for step in config["steps"]]
+        assert "scaler" in step_names
+
+    def test_create_default_pipeline_config_imputation(self) -> None:
+        """Test default pipeline configuration for imputation."""
+        # Skip test if sklearn not available
+        try:
+            SklearnPipelineFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        config = SklearnPipelineFeatureGroup._create_default_pipeline_config("imputation")
+
+        assert "steps" in config
+        assert "params" in config
+        assert len(config["steps"]) == 1
+
+        # Check step name
+        step_names = [step[0] for step in config["steps"]]
+        assert "imputer" in step_names
+
+    def test_create_default_pipeline_config_unknown(self) -> None:
+        """An unknown pipeline name is rejected rather than silently scaled.
+
+        This previously asserted the opposite: any undispatched name fell through to the
+        scaling pipeline, which is what hid the missing feature_engineering branch (#797).
+        """
+        # Skip test if sklearn not available
+        try:
+            SklearnPipelineFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        with pytest.raises(ValueError, match="Unsupported pipeline type"):
+            SklearnPipelineFeatureGroup._create_default_pipeline_config("unknown_pipeline")
+
+    def test_create_default_pipeline_config_missing_sklearn(self) -> None:
+        """Test default pipeline configuration when sklearn is not available."""
+        with patch.dict("sys.modules", {"sklearn.preprocessing": None, "sklearn.pipeline": None}):
+            with pytest.raises(ImportError, match="scikit-learn is required"):
+                SklearnPipelineFeatureGroup._create_default_pipeline_config("preprocessing")
+
+    def test_pipeline_matches_config(self) -> None:
+        """Test pipeline configuration matching."""
+        # Skip test if sklearn not available
+        try:
+            sklearn_components = SklearnPipelineFeatureGroup._import_sklearn_components()
+        except ImportError:
+            pytest.skip("scikit-learn not available")
+
+        StandardScaler = sklearn_components["StandardScaler"]
+        SimpleImputer = sklearn_components["SimpleImputer"]
+        Pipeline = sklearn_components["Pipeline"]
+
+        # Create a pipeline
+        pipeline = Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())])
+
+        # Create matching config
+        config = {"steps": [("imputer", SimpleImputer()), ("scaler", StandardScaler())], "params": {}}
+
+        assert SklearnPipelineFeatureGroup._pipeline_matches_config(pipeline, config)
+
+        # Create non-matching config (different number of steps)
+        config_different = {"steps": [("scaler", StandardScaler())], "params": {}}
+
+        assert not SklearnPipelineFeatureGroup._pipeline_matches_config(pipeline, config_different)
+
+    def test_pipeline_matches_config_no_steps(self) -> None:
+        """Test pipeline configuration matching with object without steps."""
+        mock_pipeline = Mock()
+        # Mock pipeline without steps attribute
+        del mock_pipeline.steps
+
+        config = {"steps": [("scaler", Mock())], "params": {}}
+
+        assert not SklearnPipelineFeatureGroup._pipeline_matches_config(mock_pipeline, config)
+
+    def test_abstract_methods_not_implemented(self) -> None:
+        """Test that abstract base class cannot be instantiated directly."""
+        with pytest.raises(TypeError, match="abstract method"):
+            SklearnPipelineFeatureGroup()  # type: ignore[abstract]
+
+
+PIPELINE_STEPS_VALUE = frozenset({("scaler", "StandardScaler")})
+
+
+class TestSklearnPipelineRequiredWhen:
+    """The pipeline_name / pipeline_steps requirement is a required_when contract (issue #731).
+
+    SklearnPipelineFeatureGroup overrides match_feature_group_criteria, so the mixin's
+    required_when evaluation never reached it. The declared predicates must now be enforced
+    on the override too.
+    """
+
+    def test_rejects_name_that_only_contains_the_pipeline_infix(self) -> None:
+        """Issue repro: the name is not a chained pipeline feature and neither option is given."""
+        options = Options(context={DefaultOptionKeys.in_features: ["x"]})
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("my_sklearn_pipeline_thing", options) is False
+
+    def test_accepts_string_name_inside_pipeline_types(self) -> None:
+        """A declared pipeline type maps back onto pipeline_name, so the predicate is satisfied."""
+        assert (
+            SklearnPipelineFeatureGroup.match_feature_group_criteria("x__sklearn_pipeline_scaling", Options()) is True
+        )
+
+    def test_rejects_string_name_outside_pipeline_types(self) -> None:
+        """Accepted behavior change: an undeclared pipeline name cannot map back onto pipeline_name,
+        so pipeline_name stays absent and its required_when predicate rejects the feature instead of
+        silently computing it with the default scaling pipeline."""
+        assert (
+            SklearnPipelineFeatureGroup.match_feature_group_criteria("x__sklearn_pipeline_custom", Options()) is False
+        )
+
+    def test_accepts_config_with_pipeline_name_only(self) -> None:
+        """pipeline_name present: the pipeline_steps predicate does not fire."""
+        options = Options(
+            {
+                SklearnPipelineFeatureGroup.PIPELINE_NAME: "scaling",
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("x", options) is True
+
+    def test_accepts_config_with_pipeline_steps_only(self) -> None:
+        """pipeline_steps present: the pipeline_name predicate does not fire."""
+        options = Options(
+            {
+                SklearnPipelineFeatureGroup.PIPELINE_STEPS: PIPELINE_STEPS_VALUE,
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("x", options) is True
+
+    def test_rejects_undeclared_name_bound_pipeline_name_even_with_pipeline_steps(self) -> None:
+        options = Options(
+            {
+                SklearnPipelineFeatureGroup.PIPELINE_STEPS: PIPELINE_STEPS_VALUE,
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("x__sklearn_pipeline_custom", options) is False
+
+    def test_rejects_config_with_both_pipeline_name_and_steps(self) -> None:
+        """Mutual exclusivity is the one rule a spec cannot express; the override keeps it."""
+        options = Options(
+            {
+                SklearnPipelineFeatureGroup.PIPELINE_NAME: "scaling",
+                SklearnPipelineFeatureGroup.PIPELINE_STEPS: PIPELINE_STEPS_VALUE,
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("x", options) is False
+
+    def test_rejects_config_with_neither_pipeline_name_nor_steps(self) -> None:
+        """Each option is required when the other is absent."""
+        options = Options({DefaultOptionKeys.in_features: "income"})
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("x", options) is False
+
+    def test_rejects_string_name_outside_pipeline_types_even_with_options(self) -> None:
+        """Regression pin for the real blast radius of the accepted behavior change.
+
+        The rejection is not limited to the no-options case: an undeclared pipeline name never maps back
+        onto pipeline_name, so ANY string-named pipeline outside PIPELINE_TYPES is rejected, options or not.
+        This returned True before the required_when guard.
+        """
+        options = Options({DefaultOptionKeys.in_features: "income"})
+        assert (
+            SklearnPipelineFeatureGroup.match_feature_group_criteria("income__sklearn_pipeline_custom", options)
+            is False
+        )
+
+    def test_rejects_pipeline_name_with_empty_pipeline_steps(self) -> None:
+        """Regression pin: mutual exclusivity is presence-based (is not None), not truthiness.
+
+        An empty pipeline_steps list is still a present pipeline_steps, so it collides with pipeline_name.
+        Truthiness let this pair through before the required_when guard.
+        """
+        options = Options(
+            {
+                SklearnPipelineFeatureGroup.PIPELINE_NAME: "scaling",
+                SklearnPipelineFeatureGroup.PIPELINE_STEPS: [],
+                DefaultOptionKeys.in_features: "income",
+            }
+        )
+        assert SklearnPipelineFeatureGroup.match_feature_group_criteria("x", options) is False
+
+
+class TestDefaultPipelineConfigDispatch:
+    """Every declared pipeline type must reach its own dispatch branch (see #797)."""
+
+    @staticmethod
+    def _step_names(pipeline_name: str) -> list[str]:
+        config = SklearnPipelineFeatureGroup._create_default_pipeline_config(pipeline_name)
+        return [name for name, _ in config["steps"]]
+
+    def test_every_declared_type_is_dispatched(self) -> None:
+        """No declared type may fall through to the scaling default."""
+        expected = {
+            "preprocessing": ["imputer", "scaler"],
+            "scaling": ["scaler"],
+            "imputation": ["imputer"],
+            "feature_engineering": ["poly", "scaler"],
+        }
+        assert set(expected) == set(SklearnPipelineFeatureGroup.PIPELINE_TYPES), (
+            "PIPELINE_TYPES changed; update this test so the declaration stays pinned to dispatch"
+        )
+        for pipeline_name, steps in expected.items():
+            assert self._step_names(pipeline_name) == steps, f"'{pipeline_name}' produced the wrong pipeline"
+
+    def test_feature_engineering_is_distinct_from_scaling(self) -> None:
+        """The defect in #797: feature_engineering silently produced the scaling pipeline."""
+        assert self._step_names("feature_engineering") != self._step_names("scaling")
+
+    def test_feature_engineering_generates_polynomial_features(self) -> None:
+        """feature_engineering must actually derive new features, not just rescale existing ones."""
+        config = SklearnPipelineFeatureGroup._create_default_pipeline_config("feature_engineering")
+        poly = dict(config["steps"])["poly"]
+        assert poly.degree == 2
+        assert poly.include_bias is False
+
+    def test_unknown_pipeline_type_raises(self) -> None:
+        """An undispatched type must fail loudly instead of becoming scaling."""
+        with pytest.raises(ValueError, match="Unsupported pipeline type"):
+            SklearnPipelineFeatureGroup._create_default_pipeline_config("not_a_real_type")

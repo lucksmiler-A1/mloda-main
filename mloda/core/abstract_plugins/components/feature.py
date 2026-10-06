@@ -1,0 +1,635 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from copy import copy
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+from mloda.core.abstract_plugins.components.data_types import DataType
+
+if TYPE_CHECKING:
+    from mloda.core.abstract_plugins.components.input_data.base_input_data import BaseInputData
+    from mloda.core.abstract_plugins.feature_group import FeatureGroup
+
+from mloda.core.abstract_plugins.components.domain import Domain
+from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.hashable_dict import (
+    _CYCLE,
+    HashableDict,
+    _deep_equal,
+    _deep_hashable,
+    _reduce_dict_items,
+)
+from mloda.core.abstract_plugins.components.index.index import Index
+from mloda.core.abstract_plugins.components.link import Link
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.components.options import Options, validate_forwarding_directives
+from mloda.core.abstract_plugins.components.utils import get_all_subclasses, safe_field
+from mloda.core.abstract_plugins.components.validators.feature_validator import FeatureValidator
+
+
+def normalize_feature_group_scope(
+    feature_group: str | type[FeatureGroup] | None,
+) -> str | type[FeatureGroup] | None:
+    """Normalize a feature_group scope value, raising TypeError for invalid forms."""
+    if feature_group is None:
+        return None
+    from mloda.core.abstract_plugins.feature_group import FeatureGroup
+
+    root_rejection = "feature_group cannot be the root FeatureGroup base class; a concrete subclass is required"
+    if isinstance(feature_group, str):
+        stripped = feature_group.strip()
+        # The root names no feature group family; rejected here as in the class-object form below.
+        if stripped == FeatureGroup.get_class_name():
+            raise TypeError(root_rejection)
+        return stripped or None
+    if feature_group is FeatureGroup:
+        raise TypeError(root_rejection)
+    if isinstance(feature_group, type) and issubclass(feature_group, FeatureGroup):
+        return feature_group
+    raise TypeError(
+        f"feature_group must be a FeatureGroup subclass, a class-name string, or None, "
+        f"got {type(feature_group).__name__}"
+    )
+
+
+class Feature:
+    """Represents a raw feature.
+
+    Attributes:
+        name (FeatureName): The name of the feature.
+        options (Options): The options associated with the feature.
+        domain (str | Domain | None): The domain of the feature.
+        compute_frameworks (set[type[ComputeFramework]] | None): The compute frameworks supported by the feature.
+        data_type (DataType | None): The data type of the feature.
+        initial_requested_data (bool): Whether the data was initially requested.
+        link (Link | None): The link associated with the feature.
+        index (Index | None): The index associated with the feature.
+        feature_group_scope (str | type[FeatureGroup] | None): Read by feature resolution and filter
+            matching; excluded from identity.
+        required_declarations (dict[str, str | int | float | bool | None] | None): Declared attributes a
+            candidate must offer for this feature (None value: any); excluded from identity.
+
+    Quick start (recommended progression)::
+
+        # 1. Bare strings -- simplest, no options or types
+        mloda.run_all(["income", "age"])
+
+        # 2. Feature() -- when you need options
+        mloda.run_all([Feature("income", {"data_source": "prod"})])
+
+        # 3. Typed helpers -- when you need type enforcement
+        mloda.run_all([Feature.int32_of("age"), Feature.double_of("income")])
+
+        # 4. Explicit Options with group/context -- advanced
+        mloda.run_all([Feature("income", Options(
+            group={"data_source": "prod"},
+            context={"debug": True},
+        ))])
+
+    Options passed as a plain dict go into ``Options.group`` (affects
+    feature group resolution). Use ``Options(context={...})`` for metadata
+    that should not affect grouping.
+
+    Class Methods (Convenience):
+        not_typed(name, options): Creates a Feature instance without specifying a data type.
+        str_of(name, options): Creates a Feature instance with STRING data type.
+        int32_of(name, options): Creates a Feature instance with INT32 data type.
+        int64_of(name, options): Creates a Feature instance with INT64 data type.
+        float_of(name, options): Creates a Feature instance with FLOAT data type.
+        double_of(name, options): Creates a Feature instance with DOUBLE data type.
+        boolean_of(name, options): Creates a Feature instance with BOOLEAN data type.
+        binary_of(name, options): Creates a Feature instance with BINARY data type.
+        date_of(name, options): Creates a Feature instance with DATE data type.
+        timestamp_millis_of(name, options): Creates a Feature instance with TIMESTAMP_MILLIS data type.
+        timestamp_micros_of(name, options): Creates a Feature instance with TIMESTAMP_MICROS data type.
+        decimal_of(name, options): Creates a Feature instance with DECIMAL data type.
+    """
+
+    def __init__(
+        self,
+        name: str | FeatureName,
+        options: dict[str, Any] | Options | None = None,
+        domain: str | Domain | None = None,
+        compute_framework: str | None = None,
+        data_type: DataType | str | None = None,
+        initial_requested_data: bool = False,
+        link: Link | None = None,
+        index: Index | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        forward_group: frozenset[str] | set[str] | list[str] | tuple[str, ...] | bool | None = None,
+        forward_group_exclude: frozenset[str] | set[str] | list[str] | tuple[str, ...] | None = None,
+        inherit_context_keys: frozenset[str] | set[str] | list[str] | tuple[str, ...] = frozenset(),
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ):
+        if options is None:
+            options = {}
+        self.name = FeatureName(name) if isinstance(name, str) else name
+        self.options = Options(options) if isinstance(options, dict) else options
+        self.domain = self._set_domain(domain, self.options.get("domain"))
+        if "domain" in self.options.group:
+            # Copy first: options may be a caller-owned Options instance, not a private dict.
+            self.options = copy(self.options)
+            self.options.group.pop("domain", None)
+
+        cf = self._set_compute_framework(compute_framework, self.options.get("compute_framework"))
+        self.compute_frameworks = {cf} if cf else None
+
+        self.uuid = uuid4()
+        self.framework_pinned = cf is not None
+        self.chosen_compute_framework: type[ComputeFramework] | None = None
+        self.chosen_compute_framework_reason: str | None = None
+
+        self.data_type = None
+        if data_type is not None:
+            if isinstance(data_type, DataType):
+                self.data_type = data_type
+            elif isinstance(data_type, str):
+                self.data_type = DataType(data_type)
+            else:
+                raise TypeError(
+                    f"data_type must be a DataType enum or a string matching a DataType member value, "
+                    f"got {type(data_type).__name__}"
+                )
+
+        # Engine-stamped consumer metadata; in equality/hash via cycle-safe _child_options_key (#608).
+        self.child_options: Options | None = None
+
+        self.initial_requested_data = initial_requested_data
+
+        # LINK and INDEX are excluded from equality and hash, because this way, we can define a single feature of a group with these properties.
+        self.link = link
+        self.index = index  # Index is a feature currently only used for append/union features.
+
+        # feature_group_scope is read by feature resolution and by filter matching,
+        # excluded from equality and hash like link/index.
+        self.feature_group_scope = self._set_feature_group_scope(feature_group)
+
+        # Resolution-only metadata stamped by the engine: one (consumer class name, consumer
+        # PROPERTY_MAPPING keys) entry appended per consumer feature group that declares this
+        # feature as an input feature; excluded from equality and hash like link/index. Also
+        # unioned in when value-equal requests merge at intake; membership is order-independent.
+        # Never reset: accumulates across runs on a reused instance, so the dual-option warning
+        # may read stale entries.
+        self.consumer_attributions: list[tuple[str, frozenset[str]]] = []
+
+        # Consumer resolving this feature, overwritten by the engine (None for a request);
+        # excluded from equality and hash.
+        self.resolving_consumer: str | None = None
+
+        # Feature names from the request down to this input's consumer, overwritten by the engine
+        # (empty for a request); excluded from equality and hash.
+        self.resolving_path: tuple[str, ...] = ()
+
+        # (reader class, data access) the engine matched for this feature; credential-free key in equality/hash.
+        self.input_data_match: tuple[type[BaseInputData], Any] | None = None
+
+        # Group keys forwarded onto this input feature, set by Features.merge_options; excluded
+        # from equality and hash like link/index.
+        self.forwarded_group_keys: frozenset[str] = frozenset()
+
+        # Excluded from equality and hash like feature_group_scope; each request is checked during its own
+        # resolution, before intake merges twins.
+        self.required_declarations = self._normalize_required_declarations(required_declarations)
+
+        # forward_group, forward_group_exclude and inherit_context_keys are merge directives
+        # for input features with forward-by-default semantics (None/True inherit all consumer
+        # group options, False isolates, an allowlist restricts, exclude subtracts),
+        # excluded from equality and hash like link/index.
+        # Only the literal False triggers the contradiction guard with a non-empty
+        # forward_group_exclude; an EMPTY allowlist frozenset combined with an exclude stays
+        # legal because allowlists may be computed dynamically.
+        self.forward_group: frozenset[str] | bool | None = (
+            forward_group
+            if forward_group is None or isinstance(forward_group, bool)
+            else self._normalize_allowlist(forward_group, "forward_group")
+        )
+        self.forward_group_exclude: frozenset[str] = (
+            frozenset()
+            if forward_group_exclude is None
+            else self._normalize_allowlist(forward_group_exclude, "forward_group_exclude")
+        )
+        validate_forwarding_directives(self.forward_group, self.forward_group_exclude)
+        self.inherit_context_keys = self._normalize_allowlist(inherit_context_keys, "inherit_context_keys")
+
+    def add_consumer_attribution(self, name: str, keys: frozenset[str]) -> None:
+        """Record a consumer attribution, skipping an identical (name, keys) entry.
+
+        Appended per consumer feature group that declares this feature as an input feature.
+        Idempotent, which bounds growth on an instance reused across runs but not staleness.
+        Also called by the engine to union a merged twin's entries in.
+        """
+        entry = (name, keys)
+        if entry not in self.consumer_attributions:
+            self.consumer_attributions.append(entry)
+
+    @staticmethod
+    def _normalize_allowlist(
+        value: frozenset[str] | set[str] | list[str] | tuple[str, ...], param_name: str
+    ) -> frozenset[str]:
+        if isinstance(value, str) or not isinstance(value, (frozenset, set, list, tuple)):
+            raise TypeError(f"{param_name} must be a set, frozenset, list, or tuple of str, got {type(value).__name__}")
+        for element in value:
+            if not isinstance(element, str):
+                raise TypeError(f"{param_name} elements must be str, got {type(element).__name__}")
+        return frozenset(value)
+
+    @staticmethod
+    def _normalize_required_declarations(
+        required: Mapping[str, str | int | float | bool | None] | None,
+    ) -> dict[str, str | int | float | bool | None] | None:
+        if required is None:
+            return None
+        if not isinstance(required, Mapping):
+            raise TypeError(f"required_declarations must be a Mapping, got {type(required).__name__}")
+        result: dict[str, str | int | float | bool | None] = {}
+        for key, value in required.items():
+            if not isinstance(key, str):
+                raise TypeError(f"required_declarations keys must be str, got {type(key).__name__}")
+            if value is None:
+                result[key] = None
+            elif isinstance(value, bool):
+                result[key] = bool(value)
+            elif isinstance(value, int):
+                result[key] = int(value)
+            elif isinstance(value, float):
+                result[key] = float(value)
+            elif isinstance(value, str):
+                result[key] = str.__str__(value)
+            else:
+                raise TypeError(
+                    f"required_declarations values must be str, int, float, bool or None, got {type(value).__name__}"
+                )
+        return result or None
+
+    def _set_feature_group_scope(
+        self, feature_group: str | type[FeatureGroup] | None
+    ) -> str | type[FeatureGroup] | None:
+        return normalize_feature_group_scope(feature_group)
+
+    @classmethod
+    def not_typed(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> Feature:
+        if options is None:
+            options = {}
+        name = FeatureName(name) if isinstance(name, str) else name
+        return cls(name=name, options=options, feature_group=feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def str_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> Feature:
+        return cls._typed_of(name, DataType.STRING, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def int32_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> Feature:
+        return cls._typed_of(name, DataType.INT32, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def int64_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(name, DataType.INT64, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def float_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(name, DataType.FLOAT, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def double_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(name, DataType.DOUBLE, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def boolean_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(
+            name, DataType.BOOLEAN, options, feature_group, required_declarations=required_declarations
+        )
+
+    @classmethod
+    def binary_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(name, DataType.BINARY, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def date_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(name, DataType.DATE, options, feature_group, required_declarations=required_declarations)
+
+    @classmethod
+    def timestamp_millis_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(
+            name, DataType.TIMESTAMP_MILLIS, options, feature_group, required_declarations=required_declarations
+        )
+
+    @classmethod
+    def timestamp_micros_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(
+            name, DataType.TIMESTAMP_MICROS, options, feature_group, required_declarations=required_declarations
+        )
+
+    @classmethod
+    def decimal_of(
+        cls,
+        name: str | FeatureName,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> "Feature":
+        return cls._typed_of(
+            name, DataType.DECIMAL, options, feature_group, required_declarations=required_declarations
+        )
+
+    @classmethod
+    def _typed_of(
+        cls,
+        name: str | FeatureName,
+        data_type: DataType,
+        options: dict[str, Any] | None = None,
+        feature_group: str | type[FeatureGroup] | None = None,
+        required_declarations: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> Feature:
+        if options is None:
+            options = {}
+        name = FeatureName(name) if isinstance(name, str) else name
+        return cls(
+            name=name,
+            data_type=data_type,
+            options=options,
+            feature_group=feature_group,
+            required_declarations=required_declarations,
+        )
+
+    def __eq__(self, other: Any) -> bool:
+        return self._equals(other, True)
+
+    def equals_ignoring_compute_frameworks(self, other: Any) -> bool:
+        return self._equals(other, False)
+
+    def _equals(self, other: Any, include_compute_frameworks: bool) -> bool:
+        if not isinstance(other, Feature):
+            return False
+        return (
+            self.name == other.name
+            and self.options == other.options
+            # __hash__ excludes context, so this probe meets cyclic contexts and needs the cycle-safe walk.
+            and _deep_equal(self.options.context, other.options.context)
+            and self.domain == other.domain
+            and (not include_compute_frameworks or self.compute_frameworks == other.compute_frameworks)
+            and self.data_type == other.data_type
+            and self._child_options_key() == other._child_options_key()
+            and self._input_data_match_key() == other._input_data_match_key()
+        )
+
+    def __hash__(self) -> int:
+        return self._hash(True)
+
+    def hash_ignoring_compute_frameworks(self) -> int:
+        return self._hash(False)
+
+    def _hash(self, include_compute_frameworks: bool) -> int:
+        compute_frameworks_hashable = (
+            frozenset(self.compute_frameworks)
+            if include_compute_frameworks and self.compute_frameworks is not None
+            else None
+        )
+
+        return hash(
+            (
+                self.name,
+                self.options,
+                self.domain,
+                compute_frameworks_hashable,
+                self.data_type,
+                self._child_options_key(),
+                self._input_data_match_key(),
+            )
+        )
+
+    @property
+    def input_data_match(self) -> tuple[type[BaseInputData], Any] | None:
+        return self._input_data_match
+
+    @input_data_match.setter
+    def input_data_match(self, value: tuple[type[BaseInputData], Any] | None) -> None:
+        self._input_data_match = value
+        self._input_data_match_cached_key: tuple[type[BaseInputData], str] | None = None
+        if value is not None:
+            reader, access = value
+            fallback = type(access).__name__
+            identity = safe_field(lambda: reader.data_access_identity(access), fallback)
+            self._input_data_match_cached_key = (reader, identity)
+
+    def _input_data_match_key(self) -> tuple[type[BaseInputData], str] | None:
+        return self._input_data_match_cached_key
+
+    def __copy__(self) -> Feature:
+        """A value-equal Feature owning the mutable containers __eq__/__hash__ read (#910).
+
+        options and child_options are rebuilt while every option VALUE stays shared by reference:
+        _deep_hashable falls back to repr() for an unhashable non-container leaf and the default repr
+        embeds the object address, so deep-copying a value would silently shift this Feature's hash and
+        break the very dedup the copy protects. Both containers are written in place by the engine
+        (intake forwarding, strict_type_enforcement, matcher writes), which is what the copy stops.
+
+        compute_frameworks is hashed too, so it is owned for the same reason. A shallow set() copy is
+        enough: its elements are classes, not option values with a repr/address hazard.
+
+        consumer_attributions is owned too, since the engine appends to it in place.
+        """
+        # One level: a Feature nested inside child_options.group keeps sharing its own options, the
+        # documented limitation class of _isolate_forwarded_value.
+        duplicate = self.__class__.__new__(self.__class__)
+        duplicate.__dict__.update(self.__dict__)
+        duplicate.options = copy(self.options)
+        if self.child_options is not None:
+            duplicate.child_options = copy(self.child_options)
+        if self.compute_frameworks is not None:
+            duplicate.compute_frameworks = set(self.compute_frameworks)
+        duplicate.consumer_attributions = list(self.consumer_attributions)
+        return duplicate
+
+    def _child_options_key(self) -> Any:
+        """Cycle-safe identity view of child_options for __eq__/__hash__ (#608).
+
+        child_options can hold features value-equal to self, so a deep compare recurses
+        forever. _reduce mirrors the Feature.__eq__/Options.__eq__ fields, with an id()
+        visited guard that collapses an already-seen feature to its name to terminate.
+        """
+        if self.child_options is None:
+            return None
+        return self._reduce(self.child_options.group, frozenset())
+
+    @staticmethod
+    def _reduce(value: Any, seen: frozenset[int]) -> Any:
+        if isinstance(value, Feature):
+            if id(value) in seen:
+                return ("feature", value.name)
+            seen = seen | {id(value)}
+            compute_frameworks = frozenset(value.compute_frameworks) if value.compute_frameworks is not None else None
+            child_group = Feature._reduce(value.child_options.group, seen) if value.child_options is not None else None
+            return (
+                "feature",
+                value.name,
+                Feature._reduce(value.options.group, seen),
+                Feature._reduce(value.options.context, seen),
+                value.domain,
+                compute_frameworks,
+                value.data_type,
+                child_group,
+            )
+        if isinstance(value, Options):
+            return ("options", Feature._reduce(value.group, seen))
+        if isinstance(value, HashableDict):
+            # _reduce's output is an equality key, so a node keeps its type tag here.
+            return ("hashable_dict", Feature._reduce(value.data, seen))
+        if isinstance(value, (dict, list, tuple, frozenset, set)):
+            # _reduce handles containers itself, so it needs the same cycle guard as _deep_hashable.
+            if id(value) in seen:
+                return _CYCLE
+            seen = seen | {id(value)}
+        if isinstance(value, dict):
+            items = [(key, Feature._reduce(val, seen)) for key, val in value.items()]
+            # Same canonical reduction as _deep_hashable uses.
+            return _reduce_dict_items(items)
+        if isinstance(value, (frozenset, set)):
+            return frozenset(Feature._reduce(item, seen) for item in value)
+        if isinstance(value, (list, tuple)):
+            return tuple(Feature._reduce(item, seen) for item in value)
+        return _deep_hashable(value)
+
+    def is_different_data_type(self, other: Feature) -> bool:
+        return self.name == other.name and self.data_type != other.data_type
+
+    def _split_context_hashable(self, split_keys: frozenset[str]) -> Any:
+        """Order-independent view of this feature's context values for the split keys."""
+        if not split_keys:
+            return ()
+        context = self.options.context
+        relevant = {key: context[key] for key in split_keys if key in context}
+        if not relevant:
+            return ()
+        return _deep_hashable(relevant)
+
+    def _grouping_hash(self, split_keys: frozenset[str] | None, include_data_type: bool) -> int:
+        keys = self.options.inherited_context_keys if split_keys is None else split_keys
+        compute_frameworks_hashable = (
+            frozenset(self.compute_frameworks) if self.compute_frameworks is not None else None
+        )
+        split_context = self._split_context_hashable(keys)
+        match = None if self.input_data_match is None else _deep_hashable(self.input_data_match)
+        if include_data_type and self.data_type is not None:
+            return hash((self.options, compute_frameworks_hashable, split_context, match, self.data_type))
+        return hash((self.options, compute_frameworks_hashable, split_context, match))
+
+    def similarity_hash(self, split_keys: frozenset[str] | None = None) -> int:
+        """Grouping hash over options, compute framework, split-key context values, and data type.
+
+        When split_keys is None it falls back to THIS feature's own inherited_context_keys, a
+        per-feature convenience. Production grouping in
+        ExecutionPlan.group_features_by_compute_framework_and_options passes the resolution-wide
+        union of every in-scope feature's inherited_context_keys; any caller performing grouping
+        must pass that resolution-wide split_keys rather than relying on the per-feature default.
+        data_type is excluded when None so None-typed features can join typed groups.
+        """
+        return self._grouping_hash(split_keys, include_data_type=True)
+
+    def base_similarity_hash(self, split_keys: frozenset[str] | None = None) -> int:
+        """similarity_hash without data_type, for lenient grouping of None-typed features.
+
+        split_keys follows the same rule as similarity_hash: None falls back to THIS feature's own
+        inherited_context_keys (a per-feature convenience), whereas production grouping in
+        ExecutionPlan.group_features_by_compute_framework_and_options passes the resolution-wide
+        union of every in-scope feature's inherited_context_keys. Any caller performing grouping
+        must pass that resolution-wide split_keys rather than relying on the per-feature default.
+        """
+        return self._grouping_hash(split_keys, include_data_type=False)
+
+    def _set_domain(self, domain: str | Domain | None, domain_options: str | Domain | None) -> None | Domain:
+        if domain:
+            return domain if isinstance(domain, Domain) else Domain(domain)
+        elif domain_options:
+            return domain_options if isinstance(domain_options, Domain) else Domain(domain_options)
+        return None
+
+    def _set_compute_framework(
+        self, compute_framework: str | None, compute_framework_options: str | None
+    ) -> type[ComputeFramework] | None:
+        if compute_framework:
+            return FeatureValidator.validate_and_resolve_compute_framework(
+                compute_framework, get_all_subclasses(ComputeFramework), "parameter"
+            )
+        elif compute_framework_options:
+            return FeatureValidator.validate_and_resolve_compute_framework(
+                compute_framework_options, get_all_subclasses(ComputeFramework), "options"
+            )
+        return None
+
+    def get_compute_framework(self) -> type[ComputeFramework]:
+        if self.chosen_compute_framework is not None:
+            return self.chosen_compute_framework
+        FeatureValidator.validate_compute_frameworks_resolved(self.compute_frameworks, str(self.name))
+        assert self.compute_frameworks is not None
+        if len(self.compute_frameworks) != 1:
+            raise ValueError(
+                f"Feature {self.name} has no chosen compute framework and allows {len(self.compute_frameworks)}: "
+                f"{sorted(c.get_class_name() for c in self.compute_frameworks)}."
+            )
+        return next(iter(self.compute_frameworks))
